@@ -407,3 +407,5 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 
 client.login(process.env.DISCORD_TOKEN);
+
+  
