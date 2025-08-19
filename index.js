@@ -177,19 +177,11 @@ client.on('messageCreate', async (message) => {
 
   if (username === patrykNick) {
     const patrykMsgTable = [
-      'ty patryk lepiej juz sie nie odzywaj',
-      'patryk czemu jestes cwelem?',
-      'szkoda slow',
-      'zamknij morde',
-      'żałosne',
-      'bądź moim super hero',
-      'morda psie',
-      'parada czeka',
-      'basia dyma sobotaxa',
-      'co sie robi w kinie?',
-      'w co gramy?',
-      'dolacz na kanal frajerze',
-      'basia to świnia'
+      'wypierdalaj',
+      'patryk cwel',
+      'patryk jest lgbt',
+      'mieszkam na osiedlu debowym',
+      'patryk jest murzynem' 
     ];
     message.reply(patrykMsgTable[Math.floor(Math.random() * patrykMsgTable.length)]);
     return;
@@ -197,7 +189,7 @@ client.on('messageCreate', async (message) => {
 
   if (message.content.toLowerCase().startsWith('.spam')) {
     if (username !== pardiNick) {
-      message.reply("tylko patryk tak moze");
+      message.reply("wypierdalaj");
       return;
     }
 
