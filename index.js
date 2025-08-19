@@ -186,6 +186,9 @@ client.on('messageCreate', async (message) => {
     message.reply(patrykMsgTable[Math.floor(Math.random() * patrykMsgTable.length)]);
     return;
   }
+   if (message.content.toLowerCase().startsWith('faza')) {
+    return message.reply('❌ baza lepsza.');
+  }
 
   if (message.content.toLowerCase().startsWith('.spam')) {
     if (username !== pardiNick) {
