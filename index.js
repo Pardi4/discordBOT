@@ -334,6 +334,11 @@ function playNextInQueue(guildId, channel) {
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
+    // Wyczyść poprzedni plik tymczasowy
+    if (queueData.currentSong && queueData.currentSong.isTemp) {
+      cleanupTempFile(queueData.currentSong);
+    }
+    
     if (queueData.isLooping && queueData.currentSong) {
       // Dodaj ponownie na początek kolejki jeśli loop jest włączony
       queueData.queue.unshift(queueData.currentSong);
@@ -409,6 +414,18 @@ function handleUserLeaveChannel(userName) {
     saveData({ lastJoinTimestamp, status });
     startDynamicOfflineStatus();
     console.log(`${userName} opuścił kanał. Timestamp: ${new Date(lastJoinTimestamp).toLocaleString()}`);
+  }
+}
+
+// Funkcja czyszczenia plików tymczasowych przy zakończeniu utworu
+function cleanupTempFile(songData) {
+  if (songData.isTemp && fs.existsSync(songData.path)) {
+    setTimeout(() => {
+      fs.unlink(songData.path, (err) => {
+        if (err) console.error('Błąd usuwania pliku tymczasowego:', err);
+        else console.log('Usunięto plik tymczasowy:', songData.path);
+      });
+    }, 5000); // Czekaj 5 sekund przed usunięciem
   }
 }
 
@@ -710,6 +727,64 @@ client.on('messageCreate', async (message) => {
     }
   }
 
+  // Random playlist command
+  if (message.content.toLowerCase() === '.randomplaylist' || message.content.toLowerCase() === '.rp') {
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) {
+      return message.reply('❌ Musisz być na kanale głosowym, aby uruchomić losową playlistę.');
+    }
+
+    const soundsFolder = path.join(__dirname, 'sounds', 'sounds');
+    
+    if (!fs.existsSync(soundsFolder)) {
+      return message.reply('❌ Folder z dźwiękami nie istnieje.');
+    }
+
+    try {
+      const files = fs.readdirSync(soundsFolder)
+        .filter(f => f.endsWith('.mp3'))
+        .map(f => f.replace('.mp3', ''));
+
+      if (files.length === 0) {
+        return message.reply('❌ Brak plików dźwiękowych w folderze.');
+      }
+
+      // Wymieszaj pliki
+      const shuffledFiles = [...files];
+      for (let i = shuffledFiles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffledFiles[i], shuffledFiles[j]] = [shuffledFiles[j], shuffledFiles[i]];
+      }
+
+      const queueData = getQueue(message.guild.id);
+      
+      // Dodaj wszystkie pliki do kolejki
+      shuffledFiles.forEach(soundName => {
+        const soundPath = path.join(soundsFolder, `${soundName}.mp3`);
+        const songData = {
+          name: soundName,
+          path: soundPath,
+          filter: null,
+          speed: 1.0,
+          requestedBy: message.author.username,
+          isTemp: false
+        };
+        queueData.queue.push(songData);
+      });
+
+      // Uruchom odtwarzanie jeśli nic aktualnie nie gra
+      if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
+        playNextInQueue(message.guild.id, voiceChannel);
+      }
+
+      return message.reply(`🎲 **Losowa playlista uruchomiona!**\n📊 Dodano ${files.length} utworów do kolejki w losowej kolejności.\n🔀 Pierwszych 5 utworów:\n${shuffledFiles.slice(0, 5).map((name, i) => `${i + 1}. ${name}`).join('\n')}`);
+
+    } catch (err) {
+      console.error('Błąd tworzenia losowej playlisty:', err);
+      return message.reply('❌ Błąd podczas tworzenia losowej playlisty.');
+    }
+  }
+
   // === KOMENDY MUZYCZNE ===
   
   // Pomoc dla komend muzycznych
@@ -720,7 +795,7 @@ client.on('messageCreate', async (message) => {
       fields: [
         {
           name: '▶️ Odtwarzanie',
-          value: '`.graj <nazwa>` - Dodaj plik do kolejki\n`.graj <nazwa> [filtr]` - Z filtrem (8d, echo, rate, pitch)\n`.graj <nazwa> speed <0.1-5.0>` - Z prędkością\n`.graj` + załącznik - Odtwórz wysłany plik',
+          value: '`.graj <nazwa>` - Dodaj plik do kolejki\n`.graj <nazwa> [filtr]` - Z filtrem (8d, echo, rate, pitch, bass, bassboost)\n`.graj <nazwa> speed <0.1-5.0>` - Z prędkością\n`.graj` + załącznik - Odtwórz wysłany plik',
           inline: false
         },
         {
@@ -730,7 +805,7 @@ client.on('messageCreate', async (message) => {
         },
         {
           name: '🔄 Kolejka',
-          value: '`.queue` - Pokaż kolejkę\n`.loop` - Włącz/wyłącz zapętlanie\n`.shuffle` - Wymieszaj kolejkę\n`.clear` - Wyczyść kolejkę',
+          value: '`.queue` - Pokaż kolejkę\n`.loop` - Włącz/wyłącz zapętlanie\n`.shuffle` - Wymieszaj kolejkę\n`.clear` - Wyczyść kolejkę\n`.randomplaylist` / `.rp` - Losowa playlista wszystkich dźwięków',
           inline: false
         },
         {
@@ -739,7 +814,7 @@ client.on('messageCreate', async (message) => {
           inline: false
         }
       ],
-      footer: { text: 'Filtry: 8d, echo, rate, pitch | Speed: 0.1-5.0' }
+      footer: { text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0' }
     };
     return message.reply({ embeds: [helpEmbed] });
   }
@@ -1055,7 +1130,7 @@ client.on('messageCreate', async (message) => {
     } else {
       // Sprawdź czy ostatni argument to zwykły filtr
       const possibleFilter = args[args.length - 1].toLowerCase();
-      const validFilters = ['8d', 'echo', 'rate', 'pitch'];
+      const validFilters = ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost'];
       if (validFilters.includes(possibleFilter)) {
         filter = possibleFilter;
         soundParts = args.slice(0, -1);
@@ -1187,31 +1262,5 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
   }
 });
-
-// Funkcja czyszczenia plików tymczasowych przy zakończeniu utworu
-function cleanupTempFile(songData) {
-  if (songData.isTemp && fs.existsSync(songData.path)) {
-    setTimeout(() => {
-      fs.unlink(songData.path, (err) => {
-        if (err) console.error('Błąd usuwania pliku tymczasowego:', err);
-        else console.log('Usunięto plik tymczasowy:', songData.path);
-      });
-    }, 5000); // Czekaj 5 sekund przed usunięciem
-  }
-}
-
-// Modyfikacja funkcji playNextInQueue aby obsługiwać czyszczenie plików tymczasowych
-const originalPlayNextInQueue = playNextInQueue;
-playNextInQueue = function(guildId, channel) {
-  const queueData = getQueue(guildId);
-  const previousSong = queueData.currentSong;
-  
-  // Wyczyść poprzedni plik tymczasowy
-  if (previousSong && previousSong.isTemp) {
-    cleanupTempFile(previousSong);
-  }
-  
-  return originalPlayNextInQueue(guildId, channel);
-};
 
 client.login(process.env.DISCORD_TOKEN);
