@@ -1,7 +1,7 @@
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
-const { Client, GatewayIntentBits, ActivityType, ActionRowBuilder, ButtonBuilder, ButtonStyle } = require('discord.js');
+const { Client, GatewayIntentBits, ActivityType, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
 const {
   joinVoiceChannel,
   createAudioPlayer,
@@ -15,69 +15,163 @@ const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
 
-// === ŚCIEŻKA DO PLIKU Z DANYMI ===
-const dataFile = path.join(__dirname, 'data.json');
-const usersFile = path.join(__dirname, 'users.json');
-const tempDir = path.join(__dirname, 'temp');
+// === KONFIGURACJA ===
+const CONFIG = {
+  dataFile: path.join(__dirname, 'data.json'),
+  usersFile: path.join(__dirname, 'users.json'),
+  tempDir: path.join(__dirname, 'temp'),
+  soundsDir: path.join(__dirname, 'sounds'),
+  users: {
+    patryk: 'freerice900',
+    lotus: '._lotus',
+    kaktus: 'kaktucat',
+    pardi: 'pardi1'
+  },
+  avgSongLength: 30000, // średnia długość utworu w ms (30s)
+  validFilters: ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost', 'speed']
+};
 
-// === KOLEJKA MUZYKI ===
-const musicQueues = new Map(); // guildId -> { queue: [], currentPlayer: null, isLooping: false, connection: null }
+// === ZMIENNE GLOBALNE ===
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.DirectMessages,
+  ],
+  partials: ['CHANNEL']
+});
 
-// Utwórz folder temp jeśli nie istnieje
-if (!fs.existsSync(tempDir)) {
-  fs.mkdirSync(tempDir, { recursive: true });
-}
+const musicQueues = new Map();
+let lastJoinTimestamp = null;
+let status = { name: 'muzykę 🎵', type: ActivityType.Playing };
+let dynamicStatusInterval = null;
 
-// === Funkcje pomocnicze do zapisu/odczytu ===
-function loadData() {
-  try {
-    if (!fs.existsSync(dataFile)) return {};
-    const raw = fs.readFileSync(dataFile);
-    return JSON.parse(raw);
-  } catch (err) {
-    console.error('Błąd wczytywania danych:', err);
-    return {};
+// === FUNKCJE POMOCNICZE ===
+const createTempDir = () => {
+  if (!fs.existsSync(CONFIG.tempDir)) {
+    fs.mkdirSync(CONFIG.tempDir, { recursive: true });
   }
-}
+};
 
-function saveData(data) {
+const loadJSON = (filePath, defaultValue = {}) => {
   try {
-    fs.writeFileSync(dataFile, JSON.stringify(data, null, 2));
+    if (!fs.existsSync(filePath)) return defaultValue;
+    return JSON.parse(fs.readFileSync(filePath));
   } catch (err) {
-    console.error('Błąd zapisu danych:', err);
+    console.error(`Błąd wczytywania ${filePath}:`, err);
+    return defaultValue;
   }
-}
+};
 
-function loadUsers() {
+const saveJSON = (filePath, data) => {
   try {
-    if (!fs.existsSync(usersFile)) return {};
-    const raw = fs.readFileSync(usersFile);
-    return JSON.parse(raw);
+    fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
   } catch (err) {
-    console.error('Błąd wczytywania użytkowników:', err);
-    return {};
+    console.error(`Błąd zapisu ${filePath}:`, err);
   }
-}
+};
 
-function saveUsers(users) {
-  try {
-    fs.writeFileSync(usersFile, JSON.stringify(users, null, 2));
-  } catch (err) {
-    console.error('Błąd zapisu użytkowników:', err);
+const loadData = () => loadJSON(CONFIG.dataFile);
+const saveData = (data) => saveJSON(CONFIG.dataFile, data);
+const loadUsers = () => loadJSON(CONFIG.usersFile);
+const saveUsers = (users) => saveJSON(CONFIG.usersFile, users);
+
+// === FUNKCJE STATUSU ===
+const setOnlineStatus = () => {
+  status = { name: `${CONFIG.users.patryk} jest na kanale`, type: ActivityType.Playing };
+  clearInterval(dynamicStatusInterval);
+  dynamicStatusInterval = null;
+  client.user.setPresence({ status: 'online', activities: [status] });
+  saveData({ lastJoinTimestamp, status });
+};
+
+const startDynamicOfflineStatus = () => {
+  if (!lastJoinTimestamp) lastJoinTimestamp = Date.now();
+  clearInterval(dynamicStatusInterval);
+
+  const updateDynamicStatus = () => {
+    const diff = Date.now() - lastJoinTimestamp;
+    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
+    const hours = Math.floor((diff / (1000 * 60 * 60)) % 24);
+    const minutes = Math.floor((diff / (1000 * 60)) % 60);
+    
+    client.user.setPresence({
+      status: 'online',
+      activities: [{ name: `Patryk offline: ${days}d ${hours}h ${minutes}m`, type: ActivityType.Playing }]
+    });
+  };
+
+  updateDynamicStatus();
+  dynamicStatusInterval = setInterval(updateDynamicStatus, 60 * 1000);
+  status = { name: 'dynamic', type: 0 };
+  saveData({ lastJoinTimestamp, status });
+};
+
+// === FUNKCJE KOLEJKI MUZYCZNEJ ===
+const getQueue = (guildId) => {
+  if (!musicQueues.has(guildId)) {
+    musicQueues.set(guildId, {
+      queue: [],
+      currentPlayer: null,
+      isLooping: false,
+      connection: null,
+      currentSong: null,
+      currentMessage: null
+    });
   }
-}
+  return musicQueues.get(guildId);
+};
 
-// === Funkcja podobieństwa stringów (Levenshtein distance) ===
-function levenshteinDistance(str1, str2) {
-  const matrix = [];
+const resetQueue = (guildId) => {
+  const queueData = getQueue(guildId);
+  queueData.queue = [];
+  queueData.currentSong = null;
+  queueData.isLooping = false;
   
-  for (let i = 0; i <= str2.length; i++) {
-    matrix[i] = [i];
+  if (queueData.currentPlayer) {
+    queueData.currentPlayer.stop();
+    queueData.currentPlayer = null;
   }
   
-  for (let j = 0; j <= str1.length; j++) {
-    matrix[0][j] = j;
+  if (queueData.connection) {
+    queueData.connection.destroy();
+    queueData.connection = null;
   }
+  
+  if (queueData.currentMessage) {
+    queueData.currentMessage.delete().catch(() => {});
+    queueData.currentMessage = null;
+  }
+  
+  console.log(`Zresetowano kolejkę dla serwera ${guildId}`);
+};
+
+const formatTime = (ms) => {
+  const seconds = Math.floor(ms / 1000);
+  const minutes = Math.floor(seconds / 60);
+  const hours = Math.floor(minutes / 60);
+  
+  if (hours > 0) {
+    return `${hours}h ${minutes % 60}m ${seconds % 60}s`;
+  } else if (minutes > 0) {
+    return `${minutes}m ${seconds % 60}s`;
+  } else {
+    return `${seconds}s`;
+  }
+};
+
+const calculateQueueTime = (queue) => {
+  return queue.length * CONFIG.avgSongLength;
+};
+
+// === FUNKCJE DŹWIĘKU ===
+const levenshteinDistance = (str1, str2) => {
+  const matrix = Array(str2.length + 1).fill().map(() => Array(str1.length + 1).fill(0));
+  
+  for (let i = 0; i <= str2.length; i++) matrix[i][0] = i;
+  for (let j = 0; j <= str1.length; j++) matrix[0][j] = j;
   
   for (let i = 1; i <= str2.length; i++) {
     for (let j = 1; j <= str1.length; j++) {
@@ -94,39 +188,28 @@ function levenshteinDistance(str1, str2) {
   }
   
   return matrix[str2.length][str1.length];
-}
+};
 
-function findClosestSound(searchName, soundsFolder) {
+const findClosestSound = (searchName, soundsFolder) => {
   try {
     const files = fs.readdirSync(soundsFolder).filter(f => f.endsWith('.mp3'));
     if (files.length === 0) return null;
     
-    let closestFile = files[0];
-    let minDistance = levenshteinDistance(searchName.toLowerCase(), files[0].replace('.mp3', '').toLowerCase());
-    
-    for (const file of files) {
+    return files.reduce((closest, file) => {
       const fileName = file.replace('.mp3', '').toLowerCase();
       const distance = levenshteinDistance(searchName.toLowerCase(), fileName);
-      
-      if (distance < minDistance) {
-        minDistance = distance;
-        closestFile = file;
-      }
-    }
-    
-    return closestFile.replace('.mp3', '');
+      return distance < closest.distance ? { file: file.replace('.mp3', ''), distance } : closest;
+    }, { file: files[0].replace('.mp3', ''), distance: Infinity }).file;
   } catch (err) {
     console.error('Błąd wyszukiwania plików:', err);
     return null;
   }
-}
+};
 
-// === Funkcja do pobierania plików ===
-function downloadFile(url, filename) {
+const downloadFile = (url, filename) => {
   return new Promise((resolve, reject) => {
-    const filePath = path.join(tempDir, filename);
+    const filePath = path.join(CONFIG.tempDir, filename);
     const file = fs.createWriteStream(filePath);
-    
     const httpModule = url.startsWith('https:') ? https : http;
     
     httpModule.get(url, (response) => {
@@ -136,157 +219,136 @@ function downloadFile(url, filename) {
       }
       
       response.pipe(file);
-      
       file.on('finish', () => {
         file.close();
         resolve(filePath);
       });
-      
       file.on('error', (err) => {
         fs.unlink(filePath, () => {});
         reject(err);
       });
-    }).on('error', (err) => {
-      reject(err);
-    });
+    }).on('error', reject);
   });
-}
-
-// === GLOBALNE ZMIENNE ===
-const client = new Client({
-  intents: [
-    GatewayIntentBits.Guilds,
-    GatewayIntentBits.GuildMessages,
-    GatewayIntentBits.MessageContent,
-    GatewayIntentBits.GuildVoiceStates,
-    GatewayIntentBits.DirectMessages,
-  ],
-  partials: ['CHANNEL']
-});
-
-const patrykNick = 'freerice900';
-const lotusNick = '._lotus';
-const kaktusNick = 'kaktucat';
-const pardiNick = 'pardi1';
-
-let lastJoinTimestamp = null;
-let status = {
-  name: 'muzykę 🎵',
-  type: ActivityType.Playing,
-};
-let dynamicStatusInterval = null;
-
-// === FUNKCJE STATUSU ===
-const setOnlineStatus = () => {
-  status = { name: `${patrykNick} jest na kanale`, type: ActivityType.Playing };
-
-  if (dynamicStatusInterval) {
-    clearInterval(dynamicStatusInterval);
-    dynamicStatusInterval = null;
-  }
-
-  client.user.setPresence({
-    status: 'online',
-    activities: [status]
-  });
-
-  saveData({ lastJoinTimestamp, status });
 };
 
-const startDynamicOfflineStatus = () => {
-  if (!lastJoinTimestamp) lastJoinTimestamp = Date.now();
-
-  if (dynamicStatusInterval) clearInterval(dynamicStatusInterval);
-
-  const updateDynamicStatus = () => {
-    const now = Date.now();
-    const diff = now - lastJoinTimestamp;
-    const days = Math.floor(diff / (1000 * 60 * 60 * 24));
-    const hours = Math.floor((diff / (1000 * 60 * 60)) % 24);
-    const minutes = Math.floor((diff / (1000 * 60)) % 60);
-
-    const dynamicText = `Patryk offline: ${days}d ${hours}h ${minutes}m`;
-
-    client.user.setPresence({
-      status: 'online',
-      activities: [{ name: dynamicText, type: ActivityType.Playing }]
-    });
+const createFilteredResource = (file, filterName, speed = 1.5) => {
+  const filterMap = {
+    '8d': ['-af', 'apulsator=hz=0.125'],
+    'echo': ['-af', 'aecho=0.8:0.9:1000:0.3'],
+    'rate': ['-filter:a', `atempo=${speed}`],
+    'pitch': ['-filter:a', 'asetrate=48000*1.2,aresample=48000'],
+    'speed': ['-filter:a', `atempo=${speed}`],
+    'bass': ['-af', 'equalizer=f=60:width_type=h:width=50:g=10,equalizer=f=170:width_type=h:width=50:g=10,volume=1.2'],
+    'bassboost': ['-af', 'equalizer=f=60:width_type=h:width=50:g=15,equalizer=f=170:width_type=h:width=50:g=12,equalizer=f=310:width_type=h:width=50:g=8,volume=1.5']
   };
 
-  updateDynamicStatus();
-  dynamicStatusInterval = setInterval(updateDynamicStatus, 60 * 1000);
-
-  status = { name: 'dynamic', type: 0 };
-  saveData({ lastJoinTimestamp, status });
-};
-
-// === FUNKCJE KOLEJKI MUZYCZNEJ ===
-function getQueue(guildId) {
-  if (!musicQueues.has(guildId)) {
-    musicQueues.set(guildId, {
-      queue: [],
-      currentPlayer: null,
-      isLooping: false,
-      connection: null,
-      currentSong: null
-    });
-  }
-  return musicQueues.get(guildId);
-}
-
-function resetQueue(guildId) {
-  const queueData = getQueue(guildId);
-  queueData.queue = [];
-  queueData.currentSong = null;
-  queueData.isLooping = false;
-  
-  if (queueData.currentPlayer) {
-    queueData.currentPlayer.stop();
-    queueData.currentPlayer = null;
-  }
-  
-  if (queueData.connection) {
-    queueData.connection.destroy();
-    queueData.connection = null;
-  }
-  
-  console.log(`Zresetowano kolejkę dla serwera ${guildId}`);
-}
-
-function createFilteredResource(file, filterName, speed = 1.5) {
   let ffmpegArgs = ['-i', file, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-
-  if (filterName) {
-    switch (filterName) {
-      case '8d':
-        ffmpegArgs = ['-i', file, '-af', 'apulsator=hz=0.125', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'echo':
-        ffmpegArgs = ['-i', file, '-af', 'aecho=0.8:0.9:1000:0.3', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'rate':
-        ffmpegArgs = ['-i', file, '-filter:a', `atempo=${speed}`, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'pitch':
-        ffmpegArgs = ['-i', file, '-filter:a', 'asetrate=48000*1.2,aresample=48000', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'speed':
-        ffmpegArgs = ['-i', file, '-filter:a', `atempo=${speed}`, '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'bass':
-        ffmpegArgs = ['-i', file, '-af', 'equalizer=f=60:width_type=h:width=50:g=10,equalizer=f=170:width_type=h:width=50:g=10,volume=1.2', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-      case 'bassboost':
-        ffmpegArgs = ['-i', file, '-af', 'equalizer=f=60:width_type=h:width=50:g=15,equalizer=f=170:width_type=h:width=50:g=12,equalizer=f=310:width_type=h:width=50:g=8,volume=1.5', '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
-        break;
-    }
+  
+  if (filterName && filterMap[filterName]) {
+    ffmpegArgs = ['-i', file, ...filterMap[filterName], '-f', 's16le', '-ar', '48000', '-ac', '2', 'pipe:1'];
   }
 
   const ffmpegProcess = spawn(ffmpeg, ffmpegArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
   return createAudioResource(ffmpegProcess.stdout, { inputType: StreamType.Raw });
-}
+};
 
-function playNextInQueue(guildId, channel) {
+const sendNowPlayingMessage = async (guildId, channel) => {
+  const queueData = getQueue(guildId);
+  if (!queueData.currentSong) return;
+
+  let filterText = '';
+  if (queueData.currentSong.filter === 'speed') {
+    filterText = ` (${queueData.currentSong.speed}x speed)`;
+  } else if (queueData.currentSong.filter) {
+    filterText = ` (${queueData.currentSong.filter})`;
+  }
+
+  const embed = new EmbedBuilder()
+    .setColor(0x0099FF)
+    .setTitle('🎵 Teraz gra')
+    .setDescription(`**${queueData.currentSong.name}${filterText}**`)
+    .addFields(
+      { name: '👤 Dodane przez', value: queueData.currentSong.requestedBy, inline: true },
+      { name: '📝 W kolejce', value: queueData.queue.length.toString(), inline: true },
+      { name: '🔄 Loop', value: queueData.isLooping ? 'Włączony' : 'Wyłączony', inline: true }
+    )
+    .setTimestamp();
+
+  const row = new ActionRowBuilder()
+    .addComponents(
+      new ButtonBuilder()
+        .setCustomId('music_skip')
+        .setLabel('⏭️ Skip')
+        .setStyle(ButtonStyle.Primary),
+      new ButtonBuilder()
+        .setCustomId('music_stop')
+        .setLabel('⏹️ Stop')
+        .setStyle(ButtonStyle.Danger),
+      new ButtonBuilder()
+        .setCustomId('music_pause')
+        .setLabel('⏸️ Pause')
+        .setStyle(ButtonStyle.Secondary)
+    );
+
+  try {
+    // Usuń poprzednią wiadomość jeśli istnieje
+    if (queueData.currentMessage) {
+      await queueData.currentMessage.delete().catch(() => {});
+    }
+
+    const textChannel = channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
+    if (textChannel) {
+      queueData.currentMessage = await textChannel.send({ embeds: [embed], components: [row] });
+      
+      // Collector dla przycisków
+      const collector = queueData.currentMessage.createMessageComponentCollector({ time: 300000 });
+      
+      collector.on('collect', async (interaction) => {
+        const voiceChannel = interaction.member?.voice?.channel;
+        
+        switch (interaction.customId) {
+          case 'music_skip':
+            if (!queueData.currentPlayer) {
+              return interaction.reply({ content: '❌ Nie ma aktualnie odtwarzanej muzyki.', ephemeral: true });
+            }
+            queueData.currentPlayer.stop();
+            await interaction.reply({ content: '⏭️ Pominięto utwór.', ephemeral: true });
+            break;
+            
+          case 'music_stop':
+            resetQueue(guildId);
+            await interaction.reply({ content: '⏹️ Zatrzymano muzykę i wyczyszczono kolejkę.', ephemeral: true });
+            break;
+            
+          case 'music_pause':
+            if (!queueData.currentPlayer) {
+              return interaction.reply({ content: '❌ Nie ma aktualnie odtwarzanej muzyki.', ephemeral: true });
+            }
+            if (queueData.currentPlayer.state.status === AudioPlayerStatus.Playing) {
+              queueData.currentPlayer.pause();
+              await interaction.reply({ content: '⏸️ Wstrzymano odtwarzanie.', ephemeral: true });
+            } else {
+              queueData.currentPlayer.unpause();
+              await interaction.reply({ content: '▶️ Wznowiono odtwarzanie.', ephemeral: true });
+            }
+            break;
+        }
+      });
+      
+      collector.on('end', () => {
+        const disabledRow = new ActionRowBuilder()
+          .addComponents(
+            ...row.components.map(button => ButtonBuilder.from(button).setDisabled(true))
+          );
+        queueData.currentMessage?.edit({ components: [disabledRow] }).catch(() => {});
+      });
+    }
+  } catch (error) {
+    console.error('Błąd wysyłania wiadomości now playing:', error);
+  }
+};
+
+const playNextInQueue = (guildId, channel) => {
   const queueData = getQueue(guildId);
   
   if (queueData.queue.length === 0) {
@@ -296,13 +358,16 @@ function playNextInQueue(guildId, channel) {
       queueData.connection.destroy();
       queueData.connection = null;
     }
+    if (queueData.currentMessage) {
+      queueData.currentMessage.delete().catch(() => {});
+      queueData.currentMessage = null;
+    }
     return;
   }
 
   const nextSong = queueData.queue.shift();
   queueData.currentSong = nextSong;
 
-  // Sprawdź czy kanał głosowy nadal istnieje i bot ma do niego dostęp
   try {
     if (!queueData.connection || queueData.connection.state.status === 'disconnected') {
       queueData.connection = joinVoiceChannel({
@@ -313,7 +378,6 @@ function playNextInQueue(guildId, channel) {
     }
   } catch (error) {
     console.error('Błąd połączenia z kanałem głosowym:', error);
-    // Wyczyść kolejkę jeśli nie można połączyć się z kanałem
     resetQueue(guildId);
     return;
   }
@@ -325,7 +389,9 @@ function playNextInQueue(guildId, channel) {
   queueData.connection.subscribe(player);
   player.play(resource);
 
-  // Obsługa rozłączenia
+  // Wyślij wiadomość o aktualnie granym utworze
+  sendNowPlayingMessage(guildId, channel);
+
   queueData.connection.on('stateChange', (oldState, newState) => {
     if (newState.status === 'disconnected') {
       console.log('Bot został rozłączony z kanału głosowego - resetowanie kolejki');
@@ -334,13 +400,11 @@ function playNextInQueue(guildId, channel) {
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
-    // Wyczyść poprzedni plik tymczasowy
-    if (queueData.currentSong && queueData.currentSong.isTemp) {
+    if (queueData.currentSong?.isTemp) {
       cleanupTempFile(queueData.currentSong);
     }
     
     if (queueData.isLooping && queueData.currentSong) {
-      // Dodaj ponownie na początek kolejki jeśli loop jest włączony
       queueData.queue.unshift(queueData.currentSong);
     }
     playNextInQueue(guildId, channel);
@@ -350,30 +414,36 @@ function playNextInQueue(guildId, channel) {
     console.error('Błąd audio:', error);
     playNextInQueue(guildId, channel);
   });
-}
+};
 
-// === FUNKCJE DŹWIĘKU ===
-function playJoinSound(userName, channel, guild) {
-  // Sprawdź czy użytkownik ma wyłączone dźwięki
+const cleanupTempFile = (songData) => {
+  if (songData.isTemp && fs.existsSync(songData.path)) {
+    setTimeout(() => {
+      fs.unlink(songData.path, (err) => {
+        if (err) console.error('Błąd usuwania pliku tymczasowego:', err);
+        else console.log('Usunięto plik tymczasowy:', songData.path);
+      });
+    }, 5000);
+  }
+};
+
+const playJoinSound = (userName, channel, guild) => {
   const users = loadUsers();
-  if (users[userName] && users[userName].soundsDisabled) {
-    return; // Nie odtwarzaj dźwięków dla tego użytkownika
-  }
+  if (users[userName]?.soundsDisabled) return;
 
-  // Sprawdź czy nie ma aktywnej kolejki muzycznej
   const queueData = getQueue(guild.id);
-  if (queueData.currentPlayer && queueData.currentPlayer.state.status === AudioPlayerStatus.Playing) {
-    return; // Nie przerywaj muzyki
-  }
+  if (queueData.currentPlayer?.state.status === AudioPlayerStatus.Playing) return;
 
-  let folderPath;
+  const soundFolders = {
+    [CONFIG.users.patryk]: 'patrykJoin',
+    [CONFIG.users.lotus]: 'lotusJoin',
+    [CONFIG.users.pardi]: 'pardiJoin',
+    [CONFIG.users.kaktus]: 'kaktucatJoin',
+    'Quit': 'Quit'
+  };
 
-  if (userName === patrykNick) folderPath = path.join(__dirname, 'sounds', 'patrykJoin');
-  else if (userName === lotusNick) folderPath = path.join(__dirname, 'sounds', 'lotusJoin');
-  else if (userName === pardiNick) folderPath = path.join(__dirname, 'sounds', 'pardiJoin');
-  else if (userName === kaktusNick) folderPath = path.join(__dirname, 'sounds', 'kaktucatJoin');
-  else if (userName === 'Quit') folderPath = path.join(__dirname, 'sounds', 'Quit');
-  else folderPath = path.join(__dirname, 'sounds', 'randomJoin');
+  const folderName = soundFolders[userName] || 'randomJoin';
+  const folderPath = path.join(CONFIG.soundsDir, folderName);
 
   if (!fs.existsSync(folderPath)) return;
 
@@ -391,7 +461,6 @@ function playJoinSound(userName, channel, guild) {
 
   const player = createAudioPlayer();
   const resource = createAudioResource(filePath);
-
   connection.subscribe(player);
   player.play(resource);
 
@@ -405,38 +474,16 @@ function playJoinSound(userName, channel, guild) {
     const conn = getVoiceConnection(guild.id);
     if (conn && !queueData.currentPlayer) conn.destroy();
   });
-}
+};
 
-// Funkcja przy opuszczeniu kanału przez freerice900
-function handleUserLeaveChannel(userName) {
-  if (userName === patrykNick) {
-    lastJoinTimestamp = Date.now();
-    saveData({ lastJoinTimestamp, status });
-    startDynamicOfflineStatus();
-    console.log(`${userName} opuścił kanał. Timestamp: ${new Date(lastJoinTimestamp).toLocaleString()}`);
-  }
-}
-
-// Funkcja czyszczenia plików tymczasowych przy zakończeniu utworu
-function cleanupTempFile(songData) {
-  if (songData.isTemp && fs.existsSync(songData.path)) {
-    setTimeout(() => {
-      fs.unlink(songData.path, (err) => {
-        if (err) console.error('Błąd usuwania pliku tymczasowego:', err);
-        else console.log('Usunięto plik tymczasowy:', songData.path);
-      });
-    }, 5000); // Czekaj 5 sekund przed usunięciem
-  }
-}
-
-// === Wczytaj dane przy starcie ===
+// === INICJALIZACJA ===
+createTempDir();
 const loadedData = loadData();
 if (loadedData.lastJoinTimestamp) lastJoinTimestamp = loadedData.lastJoinTimestamp;
 if (loadedData.status) status = loadedData.status;
 
 client.once('ready', () => {
   console.log(`Zalogowano jako ${client.user.tag}`);
-
   if (status.name === 'dynamic') startDynamicOfflineStatus();
   else client.user.setPresence({ status: 'online', activities: [status] });
 });
@@ -444,61 +491,350 @@ client.once('ready', () => {
 // === OBSŁUGA WIADOMOŚCI ===
 client.on('messageCreate', async (message) => {
   if (message.author.bot) return;
-
   const username = message.author.username;
 
-  if (username === patrykNick) {
+  // Odpowiedzi dla Patryka
+  if (username === CONFIG.users.patryk) {
     const patrykMsgTable = [
-      'wypierdalaj',
-      'patryk cwel',
-      'patryk jest lgbt',
-      'mieszkam na osiedlu debowym',
-      'patryk jest murzynem' 
+      'wypierdalaj', 'patryk cwel', 'patryk jest lgbt',
+      'mieszkam na osiedlu debowym', 'patryk jest murzynem'
     ];
-    message.reply(patrykMsgTable[Math.floor(Math.random() * patrykMsgTable.length)]);
-    return;
+    return message.reply(patrykMsgTable[Math.floor(Math.random() * patrykMsgTable.length)]);
   }
 
-  if (message.content.toLowerCase() === 'kto jest najlepszym botem muzycznym?') {
-    message.reply('ja');
-    
-    // Znajdź użytkownika o ID 411916947773587456
-    const targetUserId = '411916947773587456';
-    const targetMember = message.guild.members.cache.get(targetUserId);
-    
-    if (targetMember && targetMember.voice.channel) {
-      try {
-        await targetMember.voice.disconnect();
-        console.log(`Wyrzucono użytkownika ${targetMember.user.username} z kanału głosowego`);
-      } catch (error) {
-        console.error('Błąd przy wyrzucaniu użytkownika:', error);
+  // Komendy specjalne
+  const specialCommands = {
+    'kto jest najlepszym botem muzycznym?': async () => {
+      message.reply('ja');
+      const targetMember = message.guild.members.cache.get('411916947773587456');
+      if (targetMember?.voice.channel) {
+        try {
+          await targetMember.voice.disconnect();
+          console.log(`Wyrzucono użytkownika ${targetMember.user.username}`);
+        } catch (error) {
+          console.error('Błąd przy wyrzucaniu:', error);
+        }
       }
-    }
-    return;
+    },
+    'czy patryk jest cwelem?': () => message.reply('https://tenor.com/view/boxdel-tak-gif-26735455'),
+    'dlaczego patryk to cwel?': () => message.reply('https://pl.wikipedia.org/wiki/Cwel'),
+  };
+
+  const cmd = message.content.toLowerCase();
+  if (specialCommands[cmd]) return specialCommands[cmd]();
+
+  // Reakcje na słowa kluczowe
+  if (cmd.startsWith('faza')) return message.reply('❌ baza lepsza.');
+  if (['kto', 'kto?'].includes(cmd)) return message.reply('PYTAL🤣🤣😂😂😂');
+  if (cmd.includes('siema') || cmd.includes('strzałeczka')) {
+    return message.reply('https://media.discordapp.net/attachments/1071549071833182290/1201192468310392933/strzaeczka.gif');
+  }
+  if (cmd.includes('cwel')) {
+    if (username === CONFIG.users.pardi) return message.reply('pardi krol');
+    const cwelMsgTable = ['sam jestes cwel', 'patryk cwel', 'jestem lgbt', 'niggers', 'pideras'];
+    return message.reply(cwelMsgTable[Math.floor(Math.random() * cwelMsgTable.length)]);
   }
 
-  if (message.content.toLowerCase().startsWith('faza')) {
-    return message.reply('❌ baza lepsza.');
-  }
-
-  // Komenda do wyłączania dźwięków
-  if (message.content.toLowerCase() === '!jestem cwelem') {
+  // Komenda wyłączania dźwięków
+  if (cmd === '!jestem cwelem') {
     const users = loadUsers();
     if (!users[username]) users[username] = {};
-    
     users[username].soundsDisabled = !users[username].soundsDisabled;
     saveUsers(users);
+    return message.reply(users[username].soundsDisabled ? 
+      '🔇 Dźwięki przy dołączaniu/odłączaniu zostały wyłączone.' : 
+      '🔊 Dźwięki przy dołączaniu/odłączaniu zostały włączone.');
+  }
+
+  // === KOMENDY MUZYCZNE ===
+  
+  // Help - zaktualizowana lista komend
+  if (['.help', '.radio'].includes(cmd)) {
+    const helpEmbed = new EmbedBuilder()
+      .setColor(0x0099FF)
+      .setTitle('🎵 Komendy Muzyczne')
+      .addFields(
+        {
+          name: '▶️ Odtwarzanie',
+          value: [
+            '`.graj <nazwa>` - Dodaj plik do kolejki',
+            '`.graj <nazwa> [filtr]` - Z filtrem (8d, echo, rate, pitch, bass, bassboost)',
+            '`.graj <nazwa> speed <0.1-5.0>` - Z prędkością',
+            '`.graj` + załącznik - Odtwórz wysłany plik'
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: '⏯️ Kontrola',
+          value: [
+            '`.skip` - Pomiń aktualny utwór',
+            '`.stop` - Zatrzymaj muzykę i wyczyść kolejkę',
+            '`.pause` - Wstrzymaj odtwarzanie',
+            '`.resume` - Wznów odtwarzanie'
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: '🔄 Kolejka',
+          value: [
+            '`.queue` / `.q` - Pokaż kolejkę z czasem',
+            '`.loop` - Włącz/wyłącz zapętlanie',
+            '`.shuffle` - Wymieszaj kolejkę',
+            '`.clear` - Wyczyść kolejkę',
+            '`.randomplaylist` / `.rp` - Losowa playlista wszystkich dźwięków'
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: '🎛️ Informacje',
+          value: [
+            '`.np` - Aktualnie grający utwór',
+            '`.sounds` / `.dzwieki` - Lista wszystkich dźwięków z przyciskami',
+            '`.help` - Ta pomoc'
+          ].join('\n'),
+          inline: false
+        },
+        {
+          name: '⚙️ Ustawienia',
+          value: [
+            '`!jestem cwelem` - Wyłącz/włącz dźwięki join/leave',
+            '`.status <nazwa> <typ>` - Ustaw status bota',
+            '`/czas` - Czas od ostatniego wejścia Patryka',
+            '`.spam @user` - Spam użytkownika (tylko Pardi)'
+          ].join('\n'),
+          inline: false
+        }
+      )
+      .setFooter({ text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0' })
+      .setTimestamp();
     
-    if (users[username].soundsDisabled) {
-      return message.reply('🔇 Dźwięki przy dołączaniu/odłączaniu zostały wyłączone.');
-    } else {
-      return message.reply('🔊 Dźwięki przy dołączaniu/odłączaniu zostały włączone.');
+    return message.reply({ embeds: [helpEmbed] });
+  }
+
+  // Queue - ulepszona komenda z czasem
+  if (['.queue', '.q'].includes(cmd)) {
+    const queueData = getQueue(message.guild.id);
+    
+    if (!queueData.currentSong && queueData.queue.length === 0) {
+      return message.reply('📭 Kolejka jest pusta.');
+    }
+
+    const queueTime = calculateQueueTime(queueData.queue);
+    
+    const embed = new EmbedBuilder()
+      .setColor(0x0099FF)
+      .setTitle('🎵 Kolejka Muzyczna')
+      .setTimestamp();
+
+    if (queueData.currentSong) {
+      let filterText = '';
+      if (queueData.currentSong.filter === 'speed') {
+        filterText = ` (${queueData.currentSong.speed}x speed)`;
+      } else if (queueData.currentSong.filter) {
+        filterText = ` (${queueData.currentSong.filter})`;
+      }
+      
+      embed.addFields({
+        name: '🎵 Aktualnie gra',
+        value: `**${queueData.currentSong.name}${filterText}**\n👤 Dodane przez: ${queueData.currentSong.requestedBy}`,
+        inline: false
+      });
+    }
+
+    if (queueData.queue.length > 0) {
+      const queueList = queueData.queue.slice(0, 10).map((song, index) => {
+        let filterText = '';
+        if (song.filter === 'speed') {
+          filterText = ` (${song.speed}x speed)`;
+        } else if (song.filter) {
+          filterText = ` (${song.filter})`;
+        }
+        return `${index + 1}. **${song.name}${filterText}**\n👤 ${song.requestedBy}`;
+      }).join('\n\n');
+      
+      embed.addFields({
+        name: `📜 W kolejce (${queueData.queue.length} utworów)`,
+        value: queueList + (queueData.queue.length > 10 ? `\n\n... i ${queueData.queue.length - 10} więcej` : ''),
+        inline: false
+      });
+    }
+
+    const infoFields = [];
+    if (queueData.queue.length > 0) {
+      infoFields.push(`⏱️ **Czas kolejki:** ~${formatTime(queueTime)}`);
+    }
+    if (queueData.isLooping) {
+      infoFields.push('🔄 **Zapętlanie włączone**');
+    }
+    
+    if (infoFields.length > 0) {
+      embed.addFields({
+        name: 'ℹ️ Informacje',
+        value: infoFields.join('\n'),
+        inline: false
+      });
+    }
+
+    return message.reply({ embeds: [embed] });
+  }
+
+  // Random playlist - ulepszona komenda
+  if (['.randomplaylist', '.rp'].includes(cmd)) {
+    const voiceChannel = message.member?.voice?.channel;
+    if (!voiceChannel) {
+      return message.reply('❌ Musisz być na kanale głosowym, aby uruchomić losową playlistę.');
+    }
+
+    const soundsFolder = path.join(CONFIG.soundsDir, 'sounds');
+    if (!fs.existsSync(soundsFolder)) {
+      return message.reply('❌ Folder z dźwiękami nie istnieje.');
+    }
+
+    try {
+      const files = fs.readdirSync(soundsFolder)
+        .filter(f => f.endsWith('.mp3'))
+        .map(f => f.replace('.mp3', ''));
+
+      if (files.length === 0) {
+        return message.reply('❌ Brak plików dźwiękowych w folderze.');
+      }
+
+      // Wymieszaj pliki
+      const shuffledFiles = [...files];
+      for (let i = shuffledFiles.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [shuffledFiles[i], shuffledFiles[j]] = [shuffledFiles[j], shuffledFiles[i]];
+      }
+
+      const queueData = getQueue(message.guild.id);
+      
+      // Dodaj wszystkie pliki do kolejki
+      shuffledFiles.forEach(soundName => {
+        const soundPath = path.join(soundsFolder, `${soundName}.mp3`);
+        const songData = {
+          name: soundName,
+          path: soundPath,
+          filter: null,
+          speed: 1.0,
+          requestedBy: message.author.username,
+          isTemp: false
+        };
+        queueData.queue.push(songData);
+      });
+
+      // Uruchom odtwarzanie jeśli nic aktualnie nie gra
+      if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
+        playNextInQueue(message.guild.id, voiceChannel);
+      }
+
+      const totalTime = calculateQueueTime(queueData.queue);
+      const embed = new EmbedBuilder()
+        .setColor(0x00FF00)
+        .setTitle('🎲 Losowa Playlista Uruchomiona!')
+        .addFields(
+          { name: '📊 Utwory', value: files.length.toString(), inline: true },
+          { name: '⏱️ Szacowany czas', value: `~${formatTime(totalTime)}`, inline: true },
+          { name: '🔀 Status', value: 'Wymieszano losowo', inline: true }
+        )
+        .addFields({
+          name: '🎵 Pierwszych 5 utworów',
+          value: shuffledFiles.slice(0, 5).map((name, i) => `${i + 1}. ${name}`).join('\n'),
+          inline: false
+        })
+        .setTimestamp();
+
+      return message.reply({ embeds: [embed] });
+
+    } catch (err) {
+      console.error('Błąd tworzenia losowej playlisty:', err);
+      return message.reply('❌ Błąd podczas tworzenia losowej playlisty.');
     }
   }
 
-  // Komenda do wyświetlania wszystkich dźwięków z przyciskami
-  if (message.content.toLowerCase() === '.sounds' || message.content.toLowerCase() === '.dzwieki') {
-    const soundsFolder = path.join(__dirname, 'sounds', 'sounds');
+  // Komendy kontroli muzyki
+  const musicCommands = {
+    '.skip': () => {
+      const queueData = getQueue(message.guild.id);
+      if (!queueData.currentPlayer) {
+        return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
+      }
+      queueData.currentPlayer.stop();
+      return message.reply('⏭️ Pomijam aktualny utwór.');
+    },
+    
+    '.stop': () => {
+      resetQueue(message.guild.id);
+      return message.reply('⏹️ Zatrzymano muzykę i wyczyszczono kolejkę.');
+    },
+    
+    '.pause': () => {
+      const queueData = getQueue(message.guild.id);
+      if (!queueData.currentPlayer) {
+        return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
+      }
+      queueData.currentPlayer.pause();
+      return message.reply('⏸️ Wstrzymano odtwarzanie.');
+    },
+    
+    '.resume': () => {
+      const queueData = getQueue(message.guild.id);
+      if (!queueData.currentPlayer) {
+        return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
+      }
+      queueData.currentPlayer.unpause();
+      return message.reply('▶️ Wznowiono odtwarzanie.');
+    },
+    
+    '.loop': () => {
+      const queueData = getQueue(message.guild.id);
+      queueData.isLooping = !queueData.isLooping;
+      return message.reply(`🔄 Zapętlanie ${queueData.isLooping ? 'włączone' : 'wyłączone'}.`);
+    },
+    
+    '.clear': () => {
+      const queueData = getQueue(message.guild.id);
+      queueData.queue = [];
+      return message.reply('🗑️ Wyczyszczono kolejkę.');
+    },
+    
+    '.shuffle': () => {
+      const queueData = getQueue(message.guild.id);
+      if (queueData.queue.length < 2) {
+        return message.reply('❌ W kolejce musi być co najmniej 2 utwory do wymieszania.');
+      }
+      
+      for (let i = queueData.queue.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [queueData.queue[i], queueData.queue[j]] = [queueData.queue[j], queueData.queue[i]];
+      }
+      
+      return message.reply('🔀 Wymieszano kolejkę.');
+    },
+    
+    '.np': () => {
+      const queueData = getQueue(message.guild.id);
+      if (!queueData.currentSong) {
+        return message.reply('❌ Aktualnie nic nie gra.');
+      }
+      
+      let filterText = '';
+      if (queueData.currentSong.filter === 'speed') {
+        filterText = ` (${queueData.currentSong.speed}x speed)`;
+      } else if (queueData.currentSong.filter) {
+        filterText = ` (filtr: ${queueData.currentSong.filter})`;
+      }
+      
+      return message.reply(`🎵 **Aktualnie gra:** ${queueData.currentSong.name}${filterText}`);
+    }
+  };
+
+  if (musicCommands[cmd]) {
+    return musicCommands[cmd]();
+  }
+
+  // Komenda .sounds z przyciskami - ulepszona
+  if (['.sounds', '.dzwieki'].includes(cmd)) {
+    const soundsFolder = path.join(CONFIG.soundsDir, 'sounds');
     
     if (!fs.existsSync(soundsFolder)) {
       return message.reply('❌ Folder z dźwiękami nie istnieje.');
@@ -523,25 +859,21 @@ client.on('messageCreate', async (message) => {
         const end = Math.min(start + soundsPerPage, files.length);
         const pageSounds = files.slice(start, end);
 
-        const embed = {
-          color: 0x0099FF,
-          title: '🎵 Dostępne Dźwięki',
-          description: `Lista wszystkich dostępnych dźwięków (${files.length} łącznie)`,
-          fields: [
-            {
-              name: `📜 Strona ${page + 1}/${totalPages}`,
-              value: pageSounds.map((sound, index) => 
-                `\`${start + index + 1}.\` ${sound}`
-              ).join('\n'),
-              inline: false
-            }
-          ],
-          footer: { 
+        return new EmbedBuilder()
+          .setColor(0x0099FF)
+          .setTitle('🎵 Dostępne Dźwięki')
+          .setDescription(`Lista wszystkich dostępnych dźwięków (${files.length} łącznie)`)
+          .addFields({
+            name: `📜 Strona ${page + 1}/${totalPages}`,
+            value: pageSounds.map((sound, index) => 
+              `\`${start + index + 1}.\` ${sound}`
+            ).join('\n'),
+            inline: false
+          })
+          .setFooter({ 
             text: 'Użyj przycisków aby nawigować lub odtworzyć dźwięk • Kliknij "🎲 Losowy" dla przypadkowego dźwięku' 
-          }
-        };
-
-        return embed;
+          })
+          .setTimestamp();
       };
 
       const generateButtons = (page, sounds) => {
@@ -706,7 +1038,6 @@ client.on('messageCreate', async (message) => {
       });
 
       collector.on('end', () => {
-        // Usuń przyciski po zakończeniu collectora
         const disabledComponents = components.map(row => {
           const newRow = new ActionRowBuilder();
           row.components.forEach(button => {
@@ -727,269 +1058,20 @@ client.on('messageCreate', async (message) => {
     }
   }
 
-  // Random playlist command
-  if (message.content.toLowerCase() === '.randomplaylist' || message.content.toLowerCase() === '.rp') {
-    const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) {
-      return message.reply('❌ Musisz być na kanale głosowym, aby uruchomić losową playlistę.');
-    }
-
-    const soundsFolder = path.join(__dirname, 'sounds', 'sounds');
-    
-    if (!fs.existsSync(soundsFolder)) {
-      return message.reply('❌ Folder z dźwiękami nie istnieje.');
-    }
-
-    try {
-      const files = fs.readdirSync(soundsFolder)
-        .filter(f => f.endsWith('.mp3'))
-        .map(f => f.replace('.mp3', ''));
-
-      if (files.length === 0) {
-        return message.reply('❌ Brak plików dźwiękowych w folderze.');
-      }
-
-      // Wymieszaj pliki
-      const shuffledFiles = [...files];
-      for (let i = shuffledFiles.length - 1; i > 0; i--) {
-        const j = Math.floor(Math.random() * (i + 1));
-        [shuffledFiles[i], shuffledFiles[j]] = [shuffledFiles[j], shuffledFiles[i]];
-      }
-
-      const queueData = getQueue(message.guild.id);
-      
-      // Dodaj wszystkie pliki do kolejki
-      shuffledFiles.forEach(soundName => {
-        const soundPath = path.join(soundsFolder, `${soundName}.mp3`);
-        const songData = {
-          name: soundName,
-          path: soundPath,
-          filter: null,
-          speed: 1.0,
-          requestedBy: message.author.username,
-          isTemp: false
-        };
-        queueData.queue.push(songData);
-      });
-
-      // Uruchom odtwarzanie jeśli nic aktualnie nie gra
-      if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
-        playNextInQueue(message.guild.id, voiceChannel);
-      }
-
-      return message.reply(`🎲 **Losowa playlista uruchomiona!**\n📊 Dodano ${files.length} utworów do kolejki w losowej kolejności.\n🔀 Pierwszych 5 utworów:\n${shuffledFiles.slice(0, 5).map((name, i) => `${i + 1}. ${name}`).join('\n')}`);
-
-    } catch (err) {
-      console.error('Błąd tworzenia losowej playlisty:', err);
-      return message.reply('❌ Błąd podczas tworzenia losowej playlisty.');
-    }
-  }
-
-  // === KOMENDY MUZYCZNE ===
-  
-  // Pomoc dla komend muzycznych
-  if (message.content === '.help' || message.content === '.radio') {
-    const helpEmbed = {
-      color: 0x0099FF,
-      title: '🎵 Komendy Muzyczne',
-      fields: [
-        {
-          name: '▶️ Odtwarzanie',
-          value: '`.graj <nazwa>` - Dodaj plik do kolejki\n`.graj <nazwa> [filtr]` - Z filtrem (8d, echo, rate, pitch, bass, bassboost)\n`.graj <nazwa> speed <0.1-5.0>` - Z prędkością\n`.graj` + załącznik - Odtwórz wysłany plik',
-          inline: false
-        },
-        {
-          name: '⏯️ Kontrola',
-          value: '`.skip` - Pomiń aktualny utwór\n`.stop` - Zatrzymaj muzykę i wyczyść kolejkę\n`.pause` - Wstrzymaj odtwarzanie\n`.resume` - Wznów odtwarzanie',
-          inline: false
-        },
-        {
-          name: '🔄 Kolejka',
-          value: '`.queue` - Pokaż kolejkę\n`.loop` - Włącz/wyłącz zapętlanie\n`.shuffle` - Wymieszaj kolejkę\n`.clear` - Wyczyść kolejkę\n`.randomplaylist` / `.rp` - Losowa playlista wszystkich dźwięków',
-          inline: false
-        },
-        {
-          name: '🎛️ Inne',
-          value: '`.np` - Aktualnie grający utwór\n`.sounds` - Lista wszystkich dźwięków\n`!jestem cwelem` - Wyłącz/włącz dźwięki join/leave',
-          inline: false
-        }
-      ],
-      footer: { text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0' }
-    };
-    return message.reply({ embeds: [helpEmbed] });
-  }
-
-  // Skip - pomiń utwór
-  if (message.content === '.skip') {
-    const queueData = getQueue(message.guild.id);
-    if (!queueData.currentPlayer) {
-      return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
-    }
-    
-    queueData.currentPlayer.stop();
-    return message.reply('⏭️ Pomijam aktualny utwór.');
-  }
-
-  // Stop - zatrzymaj wszystko
-  if (message.content === '.stop') {
-    resetQueue(message.guild.id);
-    return message.reply('⏹️ Zatrzymano muzykę i wyczyszczono kolejkę.');
-  }
-
-  // Pause - wstrzymaj
-  if (message.content === '.pause') {
-    const queueData = getQueue(message.guild.id);
-    if (!queueData.currentPlayer) {
-      return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
-    }
-    
-    queueData.currentPlayer.pause();
-    return message.reply('⏸️ Wstrzymano odtwarzanie.');
-  }
-
-  // Resume - wznów
-  if (message.content === '.resume') {
-    const queueData = getQueue(message.guild.id);
-    if (!queueData.currentPlayer) {
-      return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
-    }
-    
-    queueData.currentPlayer.unpause();
-    return message.reply('▶️ Wznowiono odtwarzanie.');
-  }
-
-  // Loop - zapętl
-  if (message.content === '.loop') {
-    const queueData = getQueue(message.guild.id);
-    queueData.isLooping = !queueData.isLooping;
-    return message.reply(`🔄 Zapętlanie ${queueData.isLooping ? 'włączone' : 'wyłączone'}.`);
-  }
-
-  // Queue - pokaż kolejkę
-  if (message.content === '.queue' || message.content === '.q') {
-    const queueData = getQueue(message.guild.id);
-    
-    if (!queueData.currentSong && queueData.queue.length === 0) {
-      return message.reply('📭 Kolejka jest pusta.');
-    }
-
-    let queueText = '';
-    
-    if (queueData.currentSong) {
-      let filterText = '';
-      if (queueData.currentSong.filter === 'speed') {
-        filterText = ` (${queueData.currentSong.speed}x speed)`;
-      } else if (queueData.currentSong.filter) {
-        filterText = ` (${queueData.currentSong.filter})`;
-      }
-      queueText += `🎵 **Aktualnie gra:** ${queueData.currentSong.name}${filterText}\n\n`;
-    }
-
-    if (queueData.queue.length > 0) {
-      queueText += '📜 **Kolejka:**\n';
-      queueData.queue.slice(0, 10).forEach((song, index) => {
-        let filterText = '';
-        if (song.filter === 'speed') {
-          filterText = ` (${song.speed}x speed)`;
-        } else if (song.filter) {
-          filterText = ` (${song.filter})`;
-        }
-        queueText += `${index + 1}. ${song.name}${filterText}\n`;
-      });
-      
-      if (queueData.queue.length > 10) {
-        queueText += `... i ${queueData.queue.length - 10} więcej`;
-      }
-    }
-
-    if (queueData.isLooping) {
-      queueText += '\n🔄 **Zapętlanie włączone**';
-    }
-
-    return message.reply(queueText || '📭 Kolejka jest pusta.');
-  }
-
-  // Clear - wyczyść kolejkę
-  if (message.content === '.clear') {
-    const queueData = getQueue(message.guild.id);
-    queueData.queue = [];
-    return message.reply('🗑️ Wyczyszczono kolejkę.');
-  }
-
-  // Shuffle - wymieszaj kolejkę
-  if (message.content === '.shuffle') {
-    const queueData = getQueue(message.guild.id);
-    if (queueData.queue.length < 2) {
-      return message.reply('❌ W kolejce musi być co najmniej 2 utwory do wymieszania.');
-    }
-    
-    for (let i = queueData.queue.length - 1; i > 0; i--) {
-      const j = Math.floor(Math.random() * (i + 1));
-      [queueData.queue[i], queueData.queue[j]] = [queueData.queue[j], queueData.queue[i]];
-    }
-    
-    return message.reply('🔀 Wymieszano kolejkę.');
-  }
-
-  // Now playing
-  if (message.content === '.np') {
-    const queueData = getQueue(message.guild.id);
-    if (!queueData.currentSong) {
-      return message.reply('❌ Aktualnie nic nie gra.');
-    }
-    
-    let filterText = '';
-    if (queueData.currentSong.filter === 'speed') {
-      filterText = ` (${queueData.currentSong.speed}x speed)`;
-    } else if (queueData.currentSong.filter) {
-      filterText = ` (filtr: ${queueData.currentSong.filter})`;
-    }
-    
-    return message.reply(`🎵 **Aktualnie gra:** ${queueData.currentSong.name}${filterText}`);
-  }
-
   // Spam command
-  if (message.content.toLowerCase().startsWith('.spam')) {
-    if (username !== pardiNick) {
-      message.reply("wypierdalaj");
-      return;
+  if (cmd.startsWith('.spam')) {
+    if (username !== CONFIG.users.pardi) {
+      return message.reply("wypierdalaj");
     }
 
-    message.delete().catch(() => { });
+    message.delete().catch(() => {});
     const user = message.mentions.users.first();
     if (!user) return message.reply('❌ Oznacz użytkownika, którego chcesz spamować.');
     for (let i = 0; i < 5; i++) message.channel.send(`<@${user.id}>`);
     return;
   }
 
-  if (message.content.toLowerCase() === 'czy patryk jest cwelem?') {
-    message.reply('https://tenor.com/view/boxdel-tak-gif-26735455');
-    return;
-  }
-
-  if (['kto', 'kto?'].includes(message.content.toLowerCase())) {
-    message.reply('PYTAŁ🤣🤣😂😂😂');
-    return;
-  }
-
-  if (message.content.toLowerCase() === 'dlaczego patryk to cwel?') {
-    message.reply('https://pl.wikipedia.org/wiki/Cwel');
-    return;
-  }
-
-  if (message.content.toLowerCase().includes('siema') || message.content.toLowerCase().includes('strzałeczka')) {
-    message.reply('https://media.discordapp.net/attachments/1071549071833182290/1201192468310392933/strzaeczka.gif');
-    return;
-  }
-
-  if (message.content.toLowerCase().includes('cwel')) {
-    if (username === pardiNick) return message.reply('pardi krol');
-
-    const cwelMsgTable = ['sam jestes cwel', 'patryk cwel', 'jestem lgbt', 'niggers', 'pideras'];
-    message.reply(cwelMsgTable[Math.floor(Math.random() * cwelMsgTable.length)]);
-    return;
-  }
-
+  // Czas command
   if (message.content === '/czas') {
     if (!lastJoinTimestamp) return message.reply('freerice900 jeszcze nie był na kanale od restartu bota.');
 
@@ -1000,25 +1082,24 @@ client.on('messageCreate', async (message) => {
     return message.reply(`freerice900 nie był na kanale od: ${days}d ${hours}h ${minutes}min`);
   }
 
-  if (message.content.toLowerCase().startsWith('.status')) {
+  // Status command
+  if (cmd.startsWith('.status')) {
     const parts = message.content.split(' ');
     if (parts.length === 2 && parts[1] === '0') {
       if (!lastJoinTimestamp) return message.reply('freerice900 jeszcze nie był na kanale od restartu bota.');
-      if (dynamicStatusInterval) clearInterval(dynamicStatusInterval);
+      clearInterval(dynamicStatusInterval);
       startDynamicOfflineStatus();
       return message.reply('✅ Dynamiczny status z czasem od ostatniego wejścia Patryka został ustawiony.');
     }
 
-    if (parts.length < 3) return message.reply('Użycie: /status <nazwa> <typ>\nPrzykład: /status Gra 0\nLub: /status 0 dla dynamicznego czasu');
+    if (parts.length < 3) return message.reply('Użycie: .status <nazwa> <typ>\nPrzykład: .status Gra 0\nLub: .status 0 dla dynamicznego czasu');
 
     const name = parts.slice(1, -1).join(' ');
     const type = parseInt(parts[parts.length - 1]);
     if (isNaN(type) || type < 0 || type > 5) return message.reply('Typ aktywności musi być liczbą od 0 do 5.');
 
-    if (dynamicStatusInterval) {
-      clearInterval(dynamicStatusInterval);
-      dynamicStatusInterval = null;
-    }
+    clearInterval(dynamicStatusInterval);
+    dynamicStatusInterval = null;
 
     status = { name, type };
     client.user.setPresence({ status: 'online', activities: [status] });
@@ -1029,42 +1110,24 @@ client.on('messageCreate', async (message) => {
   // Komenda .graj z kolejką i obsługą załączników
   if (message.content.startsWith('.graj') || (message.content === '.graj' && message.attachments.size > 0)) {
     const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply('Musisz być na kanale głosowym, aby puścić dźwięk.');
+    if (!voiceChannel) return message.reply('❌ Musisz być na kanale głosowym, aby puścić dźwięk.');
 
     // Obsługa załączników
     if (message.attachments.size > 0) {
       const attachment = message.attachments.first();
       
       // Sprawdź czy to plik audio
-      if (!attachment.name.toLowerCase().endsWith('.mp3') && 
-          !attachment.name.toLowerCase().endsWith('.wav') && 
-          !attachment.name.toLowerCase().endsWith('.ogg') &&
-          !attachment.name.toLowerCase().endsWith('.m4a')) {
+      const audioFormats = ['.mp3', '.wav', '.ogg', '.m4a'];
+      if (!audioFormats.some(format => attachment.name.toLowerCase().endsWith(format))) {
         return message.reply('❌ Obsługiwane formaty: mp3, wav, ogg, m4a');
       }
 
       // Parsuj argumenty z komendy dla załączników
       const args = message.content.split(' ').slice(1);
-      let filter = null;
-      let speed = 1.0;
+      const { filter, speed } = parseFilterArgs(args);
 
-      // Sprawdź czy ostatni argument to speed z wartością
-      if (args.length >= 2 && args[args.length - 2].toLowerCase() === 'speed') {
-        const speedValue = parseFloat(args[args.length - 1]);
-        if (speedValue >= 0.1 && speedValue <= 5.0) {
-          filter = 'speed';
-          speed = speedValue;
-        } else {
-          return message.reply('❌ Prędkość musi być między 0.1 a 5.0');
-        }
-      } else if (args.length > 0) {
-        // Sprawdź czy ostatni argument to zwykły filtr
-        const possibleFilter = args[args.length - 1].toLowerCase();
-        const validFilters = ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost'];
-        if (validFilters.includes(possibleFilter)) {
-          filter = possibleFilter;
-          if (filter === 'rate') speed = 1.5; // domyślna prędkość dla rate
-        }
+      if (filter === 'error') {
+        return message.reply('❌ Prędkość musi być między 0.1 a 5.0');
       }
 
       try {
@@ -1083,25 +1146,12 @@ client.on('messageCreate', async (message) => {
 
         queueData.queue.push(songData);
 
+        const filterText = getFilterText(filter, speed);
+        
         if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
           playNextInQueue(message.guild.id, voiceChannel);
-          
-          let filterText = '';
-          if (filter === 'speed') {
-            filterText = ` z prędkością: ${speed}x`;
-          } else if (filter) {
-            filterText = ` z filtrem: ${filter}`;
-          }
-          
           return message.reply(`▶️ Odtwarzam: ${attachment.name}${filterText}`);
         } else {
-          let filterText = '';
-          if (filter === 'speed') {
-            filterText = ` z prędkością: ${speed}x`;
-          } else if (filter) {
-            filterText = ` z filtrem: ${filter}`;
-          }
-          
           return message.reply(`➕ Dodano do kolejki: ${attachment.name}${filterText} (pozycja: ${queueData.queue.length})`);
         }
       } catch (error) {
@@ -1111,34 +1161,15 @@ client.on('messageCreate', async (message) => {
     }
 
     const args = message.content.split(' ').slice(1);
-    if (args.length === 0) return message.reply('Podaj nazwę pliku do odtworzenia lub wyślij plik jako załącznik.');
+    if (args.length === 0) return message.reply('❌ Podaj nazwę pliku do odtworzenia lub wyślij plik jako załącznik.');
 
-    let filter = null;
-    let speed = 1.5; // domyślna prędkość
-    let soundParts = args;
-
-    // Sprawdź czy ostatni argument to speed z wartością
-    if (args.length >= 2 && args[args.length - 2].toLowerCase() === 'speed') {
-      const speedValue = parseFloat(args[args.length - 1]);
-      if (speedValue >= 0.1 && speedValue <= 5.0) {
-        filter = 'speed';
-        speed = speedValue;
-        soundParts = args.slice(0, -2); // usuń "speed" i wartość
-      } else {
-        return message.reply('❌ Prędkość musi być między 0.1 a 5.0');
-      }
-    } else {
-      // Sprawdź czy ostatni argument to zwykły filtr
-      const possibleFilter = args[args.length - 1].toLowerCase();
-      const validFilters = ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost'];
-      if (validFilters.includes(possibleFilter)) {
-        filter = possibleFilter;
-        soundParts = args.slice(0, -1);
-      }
+    const { filter, speed, soundParts } = parseFilterArgs(args, true);
+    if (filter === 'error') {
+      return message.reply('❌ Prędkość musi być między 0.1 a 5.0');
     }
 
     const soundName = soundParts.join(' ');
-    const soundsFolder = path.join(__dirname, 'sounds', 'sounds');
+    const soundsFolder = path.join(CONFIG.soundsDir, 'sounds');
     let soundPath = path.join(soundsFolder, `${soundName}.mp3`);
     let actualSoundName = soundName;
 
@@ -1165,51 +1196,37 @@ client.on('messageCreate', async (message) => {
 
     queueData.queue.push(songData);
 
+    const filterText = getFilterText(filter, speed);
+    let responseText;
+    
     if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
       playNextInQueue(message.guild.id, voiceChannel);
-      let filterText = '';
-      if (filter === 'speed') {
-        filterText = ` z prędkością: ${speed}x`;
-      } else if (filter) {
-        filterText = ` z filtrem: ${filter}`;
-      }
-      
-      let responseText = `▶️ Odtwarzam: ${actualSoundName}.mp3${filterText}`;
-      if (actualSoundName !== soundName) {
-        responseText += `\n💡 Nie znaleziono "${soundName}", odtwarzam najbliższy: "${actualSoundName}"`;
-      }
-      
-      return message.reply(responseText);
+      responseText = `▶️ Odtwarzam: ${actualSoundName}.mp3${filterText}`;
     } else {
-      let filterText = '';
-      if (filter === 'speed') {
-        filterText = ` z prędkością: ${speed}x`;
-      } else if (filter) {
-        filterText = ` z filtrem: ${filter}`;
-      }
-      
-      let responseText = `➕ Dodano do kolejki: ${actualSoundName}.mp3${filterText} (pozycja: ${queueData.queue.length})`;
-      if (actualSoundName !== soundName) {
-        responseText += `\n💡 Nie znaleziono "${soundName}", dodano najbliższy: "${actualSoundName}"`;
-      }
-      
-      return message.reply(responseText);
+      responseText = `➕ Dodano do kolejki: ${actualSoundName}.mp3${filterText} (pozycja: ${queueData.queue.length})`;
     }
+    
+    if (actualSoundName !== soundName) {
+      responseText += `\n💡 Nie znaleziono "${soundName}", użyto najbliższego: "${actualSoundName}"`;
+    }
+    
+    return message.reply(responseText);
   }
 
-  // slava ukraina - tylko gdy nie ma aktywnej muzyki
-  if (message.content.toLowerCase().includes('slava ukraina')) {
+  // Slava Ukraina - tylko gdy nie ma aktywnej muzyki
+  if (cmd.includes('slava ukraina')) {
     const voiceChannel = message.member?.voice?.channel;
-    if (!voiceChannel) return message.reply('Musisz być na kanale głosowym, aby puścić dźwięk.');
+    if (!voiceChannel) return message.reply('❌ Musisz być na kanale głosowym, aby puścić dźwięk.');
 
-    // Sprawdź czy nie ma aktywnej kolejki muzycznej
     const queueData = getQueue(message.guild.id);
-    if (queueData.currentPlayer && queueData.currentPlayer.state.status === AudioPlayerStatus.Playing) {
-      return; // Nie przerywaj muzyki
-    }
+    if (queueData.currentPlayer?.state.status === AudioPlayerStatus.Playing) return;
 
-    const folderPath = path.join(__dirname, 'sounds', 'slava');
+    const folderPath = path.join(CONFIG.soundsDir, 'slava');
+    if (!fs.existsSync(folderPath)) return;
+    
     const files = fs.readdirSync(folderPath).filter(f => f.endsWith('.mp3'));
+    if (files.length === 0) return;
+    
     const randomFile = files[Math.floor(Math.random() * files.length)];
     const soundPath = path.join(folderPath, randomFile);
 
@@ -1221,7 +1238,6 @@ client.on('messageCreate', async (message) => {
 
     const player = createAudioPlayer();
     const resource = createAudioResource(soundPath);
-
     connection.subscribe(player);
     player.play(resource);
 
@@ -1234,6 +1250,44 @@ client.on('messageCreate', async (message) => {
   }
 });
 
+// === FUNKCJE POMOCNICZE ===
+const parseFilterArgs = (args, returnSoundParts = false) => {
+  let filter = null;
+  let speed = 1.0;
+  let soundParts = args;
+
+  // Sprawdź czy ostatni argument to speed z wartością
+  if (args.length >= 2 && args[args.length - 2].toLowerCase() === 'speed') {
+    const speedValue = parseFloat(args[args.length - 1]);
+    if (speedValue >= 0.1 && speedValue <= 5.0) {
+      filter = 'speed';
+      speed = speedValue;
+      soundParts = args.slice(0, -2);
+    } else {
+      return { filter: 'error' };
+    }
+  } else if (args.length > 0) {
+    // Sprawdź czy ostatni argument to zwykły filtr
+    const possibleFilter = args[args.length - 1].toLowerCase();
+    if (CONFIG.validFilters.includes(possibleFilter)) {
+      filter = possibleFilter;
+      soundParts = args.slice(0, -1);
+      if (filter === 'rate') speed = 1.5; // domyślna prędkość dla rate
+    }
+  }
+
+  return returnSoundParts ? { filter, speed, soundParts } : { filter, speed };
+};
+
+const getFilterText = (filter, speed) => {
+  if (filter === 'speed') {
+    return ` z prędkością: ${speed}x`;
+  } else if (filter) {
+    return ` z filtrem: ${filter}`;
+  }
+  return '';
+};
+
 // === OBSŁUGA KANAŁÓW GŁOSOWYCH ===
 client.on('voiceStateUpdate', async (oldState, newState) => {
   const member = newState.member || oldState.member;
@@ -1242,18 +1296,23 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
   // Wejście lub przełączenie kanału
   if ((!oldState.channel && newState.channel) || (oldState.channel && newState.channel && oldState.channel.id !== newState.channel.id)) {
-    if (userName === patrykNick) setOnlineStatus();
+    if (userName === CONFIG.users.patryk) setOnlineStatus();
     playJoinSound(userName, newState.channel, newState.guild);
   }
 
   // Wyjście z kanału lub wyrzucenie
   if (oldState.channel && !newState.channel) {
-    // Sprawdź czy użytkownik ma wyłączone dźwięki przed odtworzeniem dźwięku Quit
     const users = loadUsers();
-    if (!users[userName] || !users[userName].soundsDisabled) {
+    if (!users[userName]?.soundsDisabled) {
       playJoinSound('Quit', oldState.channel, oldState.guild);
     }
-    handleUserLeaveChannel(userName);
+    
+    if (userName === CONFIG.users.patryk) {
+      lastJoinTimestamp = Date.now();
+      saveData({ lastJoinTimestamp, status });
+      startDynamicOfflineStatus();
+      console.log(`${userName} opuścił kanał. Timestamp: ${new Date(lastJoinTimestamp).toLocaleString()}`);
+    }
     
     // Resetuj kolejkę jeśli bot zostanie rozłączony
     if (member.user.id === client.user.id) {
