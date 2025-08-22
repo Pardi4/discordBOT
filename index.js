@@ -28,7 +28,8 @@ const CONFIG = {
     pardi: 'pardi1'
   },
   avgSongLength: 30000, // średnia długość utworu w ms (30s)
-  validFilters: ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost', 'speed']
+  validFilters: ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost', 'speed'],
+  leaveTimeout: 5 * 60 * 1000 // 5 minut w milisekundach
 };
 
 // === ZMIENNE GLOBALNE ===
@@ -99,7 +100,7 @@ const startDynamicOfflineStatus = () => {
     
     client.user.setPresence({
       status: 'online',
-      activities: [{ name: `Patryk offline: ${days}d ${hours}h ${minutes}m`, type: ActivityType.Playing }]
+      activities: [{ name: `Patryk liże stopy basi od: ${days}d ${hours}h ${minutes}m`, type: ActivityType.Playing }]
     });
   };
 
@@ -118,24 +119,33 @@ const getQueue = (guildId) => {
       isLooping: false,
       connection: null,
       currentSong: null,
-      currentMessage: null
+      currentMessage: null,
+      messageChannel: null, // Kanał gdzie została wpisana komenda
+      leaveTimeout: null // Timeout dla opuszczenia kanału
     });
   }
   return musicQueues.get(guildId);
 };
 
-const resetQueue = (guildId) => {
+const resetQueue = (guildId, destroyConnection = true) => {
   const queueData = getQueue(guildId);
   queueData.queue = [];
   queueData.currentSong = null;
   queueData.isLooping = false;
+  queueData.messageChannel = null;
+  
+  // Wyczyść timeout opuszczenia
+  if (queueData.leaveTimeout) {
+    clearTimeout(queueData.leaveTimeout);
+    queueData.leaveTimeout = null;
+  }
   
   if (queueData.currentPlayer) {
     queueData.currentPlayer.stop();
     queueData.currentPlayer = null;
   }
   
-  if (queueData.connection) {
+  if (queueData.connection && destroyConnection) {
     queueData.connection.destroy();
     queueData.connection = null;
   }
@@ -146,6 +156,40 @@ const resetQueue = (guildId) => {
   }
   
   console.log(`Zresetowano kolejkę dla serwera ${guildId}`);
+};
+
+const scheduleLeave = (guildId) => {
+  const queueData = getQueue(guildId);
+  
+  // Jeśli już jest zaplanowane opuszczenie, anuluj poprzednie
+  if (queueData.leaveTimeout) {
+    clearTimeout(queueData.leaveTimeout);
+  }
+  
+  console.log(`Planowanie opuszczenia kanału za 5 minut dla serwera ${guildId}`);
+  
+  queueData.leaveTimeout = setTimeout(() => {
+    console.log(`Opuszczanie kanału po 5 minutach bezczynności dla serwera ${guildId}`);
+    if (queueData.connection) {
+      queueData.connection.destroy();
+      queueData.connection = null;
+    }
+    queueData.leaveTimeout = null;
+    
+    // Wyślij wiadomość o opuszczeniu jeśli jest dostępny kanał
+    if (queueData.messageChannel) {
+      queueData.messageChannel.send('👋 Opuszczam kanał po 5 minutach bezczynności.').catch(() => {});
+    }
+  }, CONFIG.leaveTimeout);
+};
+
+const cancelScheduledLeave = (guildId) => {
+  const queueData = getQueue(guildId);
+  if (queueData.leaveTimeout) {
+    console.log(`Anulowanie zaplanowanego opuszczenia dla serwera ${guildId}`);
+    clearTimeout(queueData.leaveTimeout);
+    queueData.leaveTimeout = null;
+  }
 };
 
 const formatTime = (ms) => {
@@ -252,7 +296,7 @@ const createFilteredResource = (file, filterName, speed = 1.5) => {
   return createAudioResource(ffmpegProcess.stdout, { inputType: StreamType.Raw });
 };
 
-const sendNowPlayingMessage = async (guildId, channel, messageChannel = null) => {
+const sendNowPlayingMessage = async (guildId, channel) => {
   const queueData = getQueue(guildId);
   if (!queueData.currentSong) return;
 
@@ -296,8 +340,8 @@ const sendNowPlayingMessage = async (guildId, channel, messageChannel = null) =>
       await queueData.currentMessage.delete().catch(() => {});
     }
 
-    // Użyj kanału z którego wysłano komendę, lub znajdź pierwszy dostępny kanał tekstowy
-    const textChannel = messageChannel || channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
+    // Użyj zapisanego kanału komunikatu lub znajdź pierwszy dostępny kanał tekstowy
+    const textChannel = queueData.messageChannel || channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
     if (textChannel) {
       queueData.currentMessage = await textChannel.send({ embeds: [embed], components: [row] });
       
@@ -349,22 +393,25 @@ const sendNowPlayingMessage = async (guildId, channel, messageChannel = null) =>
   }
 };
 
-const playNextInQueue = (guildId, channel, messageChannel = null) => {
+const playNextInQueue = (guildId, channel) => {
   const queueData = getQueue(guildId);
   
   if (queueData.queue.length === 0) {
     queueData.currentSong = null;
     queueData.currentPlayer = null;
-    if (queueData.connection) {
-      queueData.connection.destroy();
-      queueData.connection = null;
-    }
+    
     if (queueData.currentMessage) {
       queueData.currentMessage.delete().catch(() => {});
       queueData.currentMessage = null;
     }
+    
+    // Zaplanuj opuszczenie kanału za 5 minut
+    scheduleLeave(guildId);
     return;
   }
+
+  // Anuluj zaplanowane opuszczenie jeśli jest nowa muzyka do odtworzenia
+  cancelScheduledLeave(guildId);
 
   const nextSong = queueData.queue.shift();
   queueData.currentSong = nextSong;
@@ -390,13 +437,13 @@ const playNextInQueue = (guildId, channel, messageChannel = null) => {
   queueData.connection.subscribe(player);
   player.play(resource);
 
-  // Wyślij wiadomość o aktualnie granym utworze - przekaż messageChannel
-  sendNowPlayingMessage(guildId, channel, messageChannel);
+  // Wyślij wiadomość o aktualnie granym utworze
+  sendNowPlayingMessage(guildId, channel);
 
   queueData.connection.on('stateChange', (oldState, newState) => {
     if (newState.status === 'disconnected') {
       console.log('Bot został rozłączony z kanału głosowego - resetowanie kolejki');
-      resetQueue(guildId);
+      resetQueue(guildId, false); // nie niszczyć połączenia, bo już jest rozłączone
     }
   });
 
@@ -408,12 +455,12 @@ const playNextInQueue = (guildId, channel, messageChannel = null) => {
     if (queueData.isLooping && queueData.currentSong) {
       queueData.queue.unshift(queueData.currentSong);
     }
-    playNextInQueue(guildId, channel, messageChannel);
+    playNextInQueue(guildId, channel);
   });
 
   player.on('error', error => {
     console.error('Błąd audio:', error);
-    playNextInQueue(guildId, channel, messageChannel);
+    playNextInQueue(guildId, channel);
   });
 };
 
@@ -527,10 +574,11 @@ client.on('messageCreate', async (message) => {
   // Reakcje na słowa kluczowe
   if (cmd.startsWith('faza')) return message.reply('❌ baza lepsza.');
   if (['kto', 'kto?'].includes(cmd)) return message.reply('PYTAL🤣🤣😂😂😂');
+  if (['https://media.discordapp.net/attachments/1071549071833182290/1201192468310392933/strzaeczka.gif'].includes(cmd)) return message.reply('https://media.discordapp.net/attachments/1071549071833182290/1201192468310392933/strzaeczka.gif');
   if (cmd.includes('siema') || cmd.includes('strzałeczka')) {
     return message.reply('https://media.discordapp.net/attachments/1071549071833182290/1201192468310392933/strzaeczka.gif');
   }
-  if (cmd.includes('cwel')) {
+  if (cmd.startsWith('cwel')) {
     if (username === CONFIG.users.pardi) return message.reply('pardi krol');
     const cwelMsgTable = ['sam jestes cwel', 'patryk cwel', 'jestem lgbt', 'niggers', 'pideras'];
     return message.reply(cwelMsgTable[Math.floor(Math.random() * cwelMsgTable.length)]);
@@ -606,6 +654,14 @@ client.on('messageCreate', async (message) => {
           inline: false
         }
       )
+      .addFields({
+        name: '🆕 Nowe funkcje',
+        value: [
+          '• Bot zostaje na kanale 5 minut po skończeniu playlisty',
+          '• Wiadomości o aktualnie granym utworze wysyłane na kanał z komendą'
+        ].join('\n'),
+        inline: false
+      })
       .setFooter({ text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0' })
       .setTimestamp();
     
@@ -709,6 +765,9 @@ client.on('messageCreate', async (message) => {
 
       const queueData = getQueue(message.guild.id);
       
+      // Ustaw kanał komunikatów
+      queueData.messageChannel = message.channel;
+      
       // Dodaj wszystkie pliki do kolejki
       shuffledFiles.forEach(soundName => {
         const soundPath = path.join(soundsFolder, `${soundName}.mp3`);
@@ -725,7 +784,7 @@ client.on('messageCreate', async (message) => {
 
       // Uruchom odtwarzanie jeśli nic aktualnie nie gra
       if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
-        playNextInQueue(message.guild.id, voiceChannel, message.channel);
+        playNextInQueue(message.guild.id, voiceChannel);
       }
 
       const totalTime = calculateQueueTime(queueData.queue);
@@ -740,6 +799,11 @@ client.on('messageCreate', async (message) => {
         .addFields({
           name: '🎵 Pierwszych 5 utworów',
           value: shuffledFiles.slice(0, 5).map((name, i) => `${i + 1}. ${name}`).join('\n'),
+          inline: false
+        })
+        .addFields({
+          name: '📢 Informacja',
+          value: '• Wiadomości o aktualnie grających utworach będą wysyłane na tym kanale\n• Bot zostanie na kanale przez 5 minut po zakończeniu playlisty',
           inline: false
         })
         .setTimestamp();
@@ -970,6 +1034,10 @@ client.on('messageCreate', async (message) => {
           const soundPath = path.join(soundsFolder, `${randomSound}.mp3`);
           
           const queueData = getQueue(interaction.guild.id);
+          
+          // Ustaw kanał komunikatów
+          queueData.messageChannel = message.channel;
+          
           const songData = {
             name: randomSound,
             path: soundPath,
@@ -982,7 +1050,7 @@ client.on('messageCreate', async (message) => {
           queueData.queue.push(songData);
 
           if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
-            playNextInQueue(interaction.guild.id, voiceChannel, message.channel);
+            playNextInQueue(interaction.guild.id, voiceChannel);
             await interaction.reply({ 
               content: `🎲 Losowy dźwięk: **${randomSound}.mp3**`, 
               ephemeral: true 
@@ -1012,6 +1080,10 @@ client.on('messageCreate', async (message) => {
           }
 
           const queueData = getQueue(interaction.guild.id);
+          
+          // Ustaw kanał komunikatów
+          queueData.messageChannel = message.channel;
+          
           const songData = {
             name: soundName,
             path: soundPath,
@@ -1113,6 +1185,11 @@ client.on('messageCreate', async (message) => {
     const voiceChannel = message.member?.voice?.channel;
     if (!voiceChannel) return message.reply('❌ Musisz być na kanale głosowym, aby puścić dźwięk.');
 
+    const queueData = getQueue(message.guild.id);
+    
+    // Ustaw kanał komunikatów
+    queueData.messageChannel = message.channel;
+
     // Obsługa załączników
     if (message.attachments.size > 0) {
       const attachment = message.attachments.first();
@@ -1135,7 +1212,6 @@ client.on('messageCreate', async (message) => {
         const filename = `${Date.now()}-${attachment.name}`;
         const filePath = await downloadFile(attachment.url, filename);
         
-        const queueData = getQueue(message.guild.id);
         const songData = {
           name: attachment.name,
           path: filePath,
@@ -1185,7 +1261,6 @@ client.on('messageCreate', async (message) => {
       }
     }
 
-    const queueData = getQueue(message.guild.id);
     const songData = {
       name: actualSoundName,
       path: soundPath,
@@ -1318,7 +1393,7 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     // Resetuj kolejkę jeśli bot zostanie rozłączony
     if (member.user.id === client.user.id) {
       console.log('Bot został rozłączony z kanału głosowego - resetowanie kolejki');
-      resetQueue(oldState.guild.id);
+      resetQueue(oldState.guild.id, false); // nie niszczyć połączenia, bo już jest rozłączone
     }
   }
 });
