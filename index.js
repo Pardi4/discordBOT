@@ -252,7 +252,7 @@ const createFilteredResource = (file, filterName, speed = 1.5) => {
   return createAudioResource(ffmpegProcess.stdout, { inputType: StreamType.Raw });
 };
 
-const sendNowPlayingMessage = async (guildId, channel) => {
+const sendNowPlayingMessage = async (guildId, channel, messageChannel = null) => {
   const queueData = getQueue(guildId);
   if (!queueData.currentSong) return;
 
@@ -296,7 +296,8 @@ const sendNowPlayingMessage = async (guildId, channel) => {
       await queueData.currentMessage.delete().catch(() => {});
     }
 
-    const textChannel = channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
+    // Użyj kanału z którego wysłano komendę, lub znajdź pierwszy dostępny kanał tekstowy
+    const textChannel = messageChannel || channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
     if (textChannel) {
       queueData.currentMessage = await textChannel.send({ embeds: [embed], components: [row] });
       
@@ -348,7 +349,7 @@ const sendNowPlayingMessage = async (guildId, channel) => {
   }
 };
 
-const playNextInQueue = (guildId, channel) => {
+const playNextInQueue = (guildId, channel, messageChannel = null) => {
   const queueData = getQueue(guildId);
   
   if (queueData.queue.length === 0) {
@@ -389,8 +390,8 @@ const playNextInQueue = (guildId, channel) => {
   queueData.connection.subscribe(player);
   player.play(resource);
 
-  // Wyślij wiadomość o aktualnie granym utworze
-  sendNowPlayingMessage(guildId, channel);
+  // Wyślij wiadomość o aktualnie granym utworze - przekaż messageChannel
+  sendNowPlayingMessage(guildId, channel, messageChannel);
 
   queueData.connection.on('stateChange', (oldState, newState) => {
     if (newState.status === 'disconnected') {
@@ -407,12 +408,12 @@ const playNextInQueue = (guildId, channel) => {
     if (queueData.isLooping && queueData.currentSong) {
       queueData.queue.unshift(queueData.currentSong);
     }
-    playNextInQueue(guildId, channel);
+    playNextInQueue(guildId, channel, messageChannel);
   });
 
   player.on('error', error => {
     console.error('Błąd audio:', error);
-    playNextInQueue(guildId, channel);
+    playNextInQueue(guildId, channel, messageChannel);
   });
 };
 
@@ -724,7 +725,7 @@ client.on('messageCreate', async (message) => {
 
       // Uruchom odtwarzanie jeśli nic aktualnie nie gra
       if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
-        playNextInQueue(message.guild.id, voiceChannel);
+        playNextInQueue(message.guild.id, voiceChannel, message.channel);
       }
 
       const totalTime = calculateQueueTime(queueData.queue);
@@ -981,7 +982,7 @@ client.on('messageCreate', async (message) => {
           queueData.queue.push(songData);
 
           if (!queueData.currentPlayer || queueData.currentPlayer.state.status === AudioPlayerStatus.Idle) {
-            playNextInQueue(interaction.guild.id, voiceChannel);
+            playNextInQueue(interaction.guild.id, voiceChannel, message.channel);
             await interaction.reply({ 
               content: `🎲 Losowy dźwięk: **${randomSound}.mp3**`, 
               ephemeral: true 
