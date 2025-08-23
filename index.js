@@ -1403,16 +1403,38 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
 
 
 
+client.once('ready', () => {
+    console.log(`Bot zalogowany jako ${client.user.tag}!`);
+});
+
+// Funkcja do wysłania wiadomości
 async function sendMessageToChannel() {
-    const channelId = '1399804703491231774';
+    const channelId = '1399804703491231774'; // Zamień na rzeczywiste ID kanału
     const channel = client.channels.cache.get(channelId);
+    
+    if (!channel) {
+        console.error('Nie znaleziono kanału o podanym ID');
+        return;
+    }
+    
+    // Tworzenie embedu z czerwonym kolorem
     const embed = new EmbedBuilder()
-        .setColor(0xFF0000)
+        .setColor(0xFF0000) // Czerwony kolor
         .setDescription('JEBAC WAS KURWY');
+    
+    try {
+        await channel.send({ embeds: [embed] });
+        console.log('Wiadomość została wysłana!');
+    } catch (error) {
+        console.error('Błąd podczas wysyłania wiadomości:', error);
+    }
 }
+
+// Event listener dla gotowości bota
 client.on('ready', () => {
     sendMessageToChannel();
 });
 
 
 client.login(process.env.DISCORD_TOKEN);
+
