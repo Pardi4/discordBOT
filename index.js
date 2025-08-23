@@ -154,8 +154,6 @@ const resetQueue = (guildId, destroyConnection = true) => {
     queueData.currentMessage.delete().catch(() => {});
     queueData.currentMessage = null;
   }
-  
-  console.log(`Zresetowano kolejkę dla serwera ${guildId}`);
 };
 
 const scheduleLeave = (guildId) => {
@@ -166,10 +164,8 @@ const scheduleLeave = (guildId) => {
     clearTimeout(queueData.leaveTimeout);
   }
   
-  console.log(`Planowanie opuszczenia kanału za 5 minut dla serwera ${guildId}`);
-  
   queueData.leaveTimeout = setTimeout(() => {
-    console.log(`Opuszczanie kanału po 5 minutach bezczynności dla serwera ${guildId}`);
+    
     if (queueData.connection) {
       queueData.connection.destroy();
       queueData.connection = null;
@@ -186,7 +182,6 @@ const scheduleLeave = (guildId) => {
 const cancelScheduledLeave = (guildId) => {
   const queueData = getQueue(guildId);
   if (queueData.leaveTimeout) {
-    console.log(`Anulowanie zaplanowanego opuszczenia dla serwera ${guildId}`);
     clearTimeout(queueData.leaveTimeout);
     queueData.leaveTimeout = null;
   }
@@ -362,7 +357,7 @@ const sendNowPlayingMessage = async (guildId, channel) => {
             
           case 'music_stop':
             resetQueue(guildId);
-            await interaction.reply({ content: '⏹️ Zatrzymano muzykę i wyczyszczono kolejkę.', ephemeral: true });
+            await interaction.reply({ content: '⏹️ Zatrzymano muzykę', ephemeral: true });
             break;
             
           case 'music_pause':
@@ -442,7 +437,6 @@ const playNextInQueue = (guildId, channel) => {
 
   queueData.connection.on('stateChange', (oldState, newState) => {
     if (newState.status === 'disconnected') {
-      console.log('Bot został rozłączony z kanału głosowego - resetowanie kolejki');
       resetQueue(guildId, false); // nie niszczyć połączenia, bo już jest rozłączone
     }
   });
@@ -819,6 +813,15 @@ client.on('messageCreate', async (message) => {
   // Komendy kontroli muzyki
   const musicCommands = {
     '.skip': () => {
+      const queueData = getQueue(message.guild.id);
+      if (!queueData.currentPlayer) {
+        return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
+      }
+      queueData.currentPlayer.stop();
+      return message.reply('⏭️ Pomijam aktualny utwór.');
+    },
+
+    '.s': () => {
       const queueData = getQueue(message.guild.id);
       if (!queueData.currentPlayer) {
         return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
@@ -1397,5 +1400,19 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
     }
   }
 });
+
+
+
+async function sendMessageToChannel() {
+    const channelId = '1399804703491231774';
+    const channel = client.channels.cache.get(channelId);
+    const embed = new EmbedBuilder()
+        .setColor(0xFF0000)
+        .setDescription('JEBAC WAS KURWY');
+}
+client.on('ready', () => {
+    sendMessageToChannel();
+});
+
 
 client.login(process.env.DISCORD_TOKEN);
