@@ -14,11 +14,14 @@ const ffmpeg = require('ffmpeg-static');
 const { spawn } = require('child_process');
 const https = require('https');
 const http = require('http');
+const { promisify } = require('util');
+const execFile = promisify(require('child_process').execFile);
 
 // === KONFIGURACJA ===
 const CONFIG = {
   dataFile: path.join(__dirname, 'data.json'),
   usersFile: path.join(__dirname, 'users.json'),
+  crossfadeFile: path.join(__dirname, 'crossfade.json'),
   tempDir: path.join(__dirname, 'temp'),
   soundsDir: path.join(__dirname, 'sounds'),
   users: {
@@ -29,7 +32,13 @@ const CONFIG = {
   },
   avgSongLength: 30000, // średnia długość utworu w ms (30s)
   validFilters: ['8d', 'echo', 'rate', 'pitch', 'bass', 'bassboost', 'speed'],
-  leaveTimeout: 5 * 60 * 1000 // 5 minut w milisekundach
+  leaveTimeout: 5 * 60 * 1000, // 5 minut w milisekundach
+  crossfade: {
+    enabled: true,
+    duration: 3, // sekundy
+    type: 'linear', // linear, exponential, logarithmic
+    minTrackLength: 10 // minimalna długość utworu dla crossfade w sekundach
+  }
 };
 
 // === ZMIENNE GLOBALNE ===
@@ -78,6 +87,54 @@ const loadData = () => loadJSON(CONFIG.dataFile);
 const saveData = (data) => saveJSON(CONFIG.dataFile, data);
 const loadUsers = () => loadJSON(CONFIG.usersFile);
 const saveUsers = (users) => saveJSON(CONFIG.usersFile, users);
+const loadCrossfadeSettings = () => loadJSON(CONFIG.crossfadeFile, CONFIG.crossfade);
+const saveCrossfadeSettings = (settings) => saveJSON(CONFIG.crossfadeFile, settings);
+
+// === FUNKCJE CROSSFADE ===
+const getAudioDuration = async (filePath) => {
+  try {
+    const { stdout } = await execFile('ffprobe', [
+      '-v', 'quiet',
+      '-show_entries', 'format=duration',
+      '-of', 'csv=p=0',
+      filePath
+    ]);
+    return parseFloat(stdout.trim());
+  } catch (error) {
+    console.error('Błąd pobierania długości audio:', error);
+    return CONFIG.avgSongLength / 1000; // fallback do średniej długości
+  }
+};
+
+const createCrossfadeResource = (filePath, fadeType, fadeTime, isIntro = false) => {
+  const fadeMap = {
+    linear: isIntro ? `afade=t=in:st=0:d=${fadeTime}` : `afade=t=out:st=${fadeTime}:d=${fadeTime}`,
+    exponential: isIntro ? `afade=t=in:st=0:d=${fadeTime}:curve=exp` : `afade=t=out:st=${fadeTime}:d=${fadeTime}:curve=exp`,
+    logarithmic: isIntro ? `afade=t=in:st=0:d=${fadeTime}:curve=log` : `afade=t=out:st=${fadeTime}:d=${fadeTime}:curve=log`
+  };
+
+  const fadeFilter = fadeMap[fadeType] || fadeMap.linear;
+  
+  const ffmpegArgs = [
+    '-i', filePath,
+    '-af', fadeFilter,
+    '-f', 's16le',
+    '-ar', '48000',
+    '-ac', '2',
+    'pipe:1'
+  ];
+
+  const ffmpegProcess = spawn(ffmpeg, ffmpegArgs, { stdio: ['ignore', 'pipe', 'ignore'] });
+  return createAudioResource(ffmpegProcess.stdout, { inputType: StreamType.Raw });
+};
+
+const shouldUseCrossfade = (currentSong, nextSong, settings) => {
+  if (!settings.enabled) return false;
+  if (!currentSong || !nextSong) return false;
+  if (currentSong.isTemp || nextSong.isTemp) return false; // Nie używaj crossfade dla plików tymczasowych
+  if (currentSong.filter || nextSong.filter) return false; // Nie używaj crossfade z filtrami
+  return true;
+};
 
 // === FUNKCJE STATUSU ===
 const setOnlineStatus = () => {
@@ -116,12 +173,15 @@ const getQueue = (guildId) => {
     musicQueues.set(guildId, {
       queue: [],
       currentPlayer: null,
+      nextPlayer: null, // Nowy player dla crossfade
       isLooping: false,
       connection: null,
       currentSong: null,
       currentMessage: null,
-      messageChannel: null, // Kanał gdzie została wpisana komenda
-      leaveTimeout: null // Timeout dla opuszczenia kanału
+      messageChannel: null,
+      leaveTimeout: null,
+      crossfadeTimeout: null, // Timeout dla crossfade
+      isCrossfading: false // Flag czy aktualnie trwa crossfade
     });
   }
   return musicQueues.get(guildId);
@@ -133,16 +193,27 @@ const resetQueue = (guildId, destroyConnection = true) => {
   queueData.currentSong = null;
   queueData.isLooping = false;
   queueData.messageChannel = null;
+  queueData.isCrossfading = false;
   
-  // Wyczyść timeout opuszczenia
+  // Wyczyść timeouty
   if (queueData.leaveTimeout) {
     clearTimeout(queueData.leaveTimeout);
     queueData.leaveTimeout = null;
   }
   
+  if (queueData.crossfadeTimeout) {
+    clearTimeout(queueData.crossfadeTimeout);
+    queueData.crossfadeTimeout = null;
+  }
+  
   if (queueData.currentPlayer) {
     queueData.currentPlayer.stop();
     queueData.currentPlayer = null;
+  }
+  
+  if (queueData.nextPlayer) {
+    queueData.nextPlayer.stop();
+    queueData.nextPlayer = null;
   }
   
   if (queueData.connection && destroyConnection) {
@@ -159,20 +230,17 @@ const resetQueue = (guildId, destroyConnection = true) => {
 const scheduleLeave = (guildId) => {
   const queueData = getQueue(guildId);
   
-  // Jeśli już jest zaplanowane opuszczenie, anuluj poprzednie
   if (queueData.leaveTimeout) {
     clearTimeout(queueData.leaveTimeout);
   }
   
   queueData.leaveTimeout = setTimeout(() => {
-    
     if (queueData.connection) {
       queueData.connection.destroy();
       queueData.connection = null;
     }
     queueData.leaveTimeout = null;
     
-    // Wyślij wiadomość o opuszczeniu jeśli jest dostępny kanał
     if (queueData.messageChannel) {
       queueData.messageChannel.send('👋 Opuszczam kanał po 5 minutach bezczynności.').catch(() => {});
     }
@@ -295,6 +363,7 @@ const sendNowPlayingMessage = async (guildId, channel) => {
   const queueData = getQueue(guildId);
   if (!queueData.currentSong) return;
 
+  const crossfadeSettings = loadCrossfadeSettings();
   let filterText = '';
   if (queueData.currentSong.filter === 'speed') {
     filterText = ` (${queueData.currentSong.speed}x speed)`;
@@ -310,8 +379,18 @@ const sendNowPlayingMessage = async (guildId, channel) => {
       { name: '👤 Dodane przez', value: queueData.currentSong.requestedBy, inline: true },
       { name: '📝 W kolejce', value: queueData.queue.length.toString(), inline: true },
       { name: '🔄 Loop', value: queueData.isLooping ? 'Włączony' : 'Wyłączony', inline: true }
-    )
-    .setTimestamp();
+    );
+
+  // Dodaj informacje o crossfade jeśli jest włączony
+  if (crossfadeSettings.enabled) {
+    embed.addFields({
+      name: '🎛️ Crossfade', 
+      value: `${crossfadeSettings.duration}s ${crossfadeSettings.type}`, 
+      inline: true
+    });
+  }
+
+  embed.setTimestamp();
 
   const row = new ActionRowBuilder()
     .addComponents(
@@ -330,17 +409,14 @@ const sendNowPlayingMessage = async (guildId, channel) => {
     );
 
   try {
-    // Usuń poprzednią wiadomość jeśli istnieje
     if (queueData.currentMessage) {
       await queueData.currentMessage.delete().catch(() => {});
     }
 
-    // Użyj zapisanego kanału komunikatu lub znajdź pierwszy dostępny kanał tekstowy
     const textChannel = queueData.messageChannel || channel.guild.channels.cache.find(ch => ch.type === 0 && ch.permissionsFor(channel.guild.members.me).has(['SendMessages', 'ViewChannel']));
     if (textChannel) {
       queueData.currentMessage = await textChannel.send({ embeds: [embed], components: [row] });
       
-      // Collector dla przycisków
       const collector = queueData.currentMessage.createMessageComponentCollector({ time: 300000 });
       
       collector.on('collect', async (interaction) => {
@@ -388,24 +464,24 @@ const sendNowPlayingMessage = async (guildId, channel) => {
   }
 };
 
-const playNextInQueue = (guildId, channel) => {
+const playNextInQueue = async (guildId, channel) => {
   const queueData = getQueue(guildId);
   
   if (queueData.queue.length === 0) {
     queueData.currentSong = null;
     queueData.currentPlayer = null;
+    queueData.nextPlayer = null;
+    queueData.isCrossfading = false;
     
     if (queueData.currentMessage) {
       queueData.currentMessage.delete().catch(() => {});
       queueData.currentMessage = null;
     }
     
-    // Zaplanuj opuszczenie kanału za 5 minut
     scheduleLeave(guildId);
     return;
   }
 
-  // Anuluj zaplanowane opuszczenie jeśli jest nowa muzyka do odtworzenia
   cancelScheduledLeave(guildId);
 
   const nextSong = queueData.queue.shift();
@@ -426,22 +502,53 @@ const playNextInQueue = (guildId, channel) => {
   }
 
   const player = createAudioPlayer();
-  const resource = createFilteredResource(nextSong.path, nextSong.filter, nextSong.speed);
+  let resource;
+
+  // Sprawdź czy crossfade jest możliwy dla następnego utworu
+  const crossfadeSettings = loadCrossfadeSettings();
+  const nextInQueue = queueData.queue[0];
+  const shouldCrossfade = shouldUseCrossfade(nextSong, nextInQueue, crossfadeSettings);
+
+  if (nextSong.filter || nextSong.speed !== 1.0) {
+    resource = createFilteredResource(nextSong.path, nextSong.filter, nextSong.speed);
+  } else {
+    resource = createAudioResource(nextSong.path);
+  }
 
   queueData.currentPlayer = player;
   queueData.connection.subscribe(player);
   player.play(resource);
 
-  // Wyślij wiadomość o aktualnie granym utworze
   sendNowPlayingMessage(guildId, channel);
+
+  // Jeśli crossfade jest możliwy, przygotuj następny utwór
+  if (shouldCrossfade && nextInQueue) {
+    try {
+      const currentDuration = await getAudioDuration(nextSong.path);
+      const crossfadeStartTime = Math.max(0, (currentDuration - crossfadeSettings.duration) * 1000);
+      
+      if (currentDuration > crossfadeSettings.minTrackLength) {
+        queueData.crossfadeTimeout = setTimeout(async () => {
+          await startCrossfade(guildId, channel, crossfadeSettings);
+        }, crossfadeStartTime);
+      }
+    } catch (error) {
+      console.error('Błąd przygotowania crossfade:', error);
+    }
+  }
 
   queueData.connection.on('stateChange', (oldState, newState) => {
     if (newState.status === 'disconnected') {
-      resetQueue(guildId, false); // nie niszczyć połączenia, bo już jest rozłączone
+      resetQueue(guildId, false);
     }
   });
 
   player.on(AudioPlayerStatus.Idle, () => {
+    if (queueData.crossfadeTimeout) {
+      clearTimeout(queueData.crossfadeTimeout);
+      queueData.crossfadeTimeout = null;
+    }
+    
     if (queueData.currentSong?.isTemp) {
       cleanupTempFile(queueData.currentSong);
     }
@@ -449,13 +556,116 @@ const playNextInQueue = (guildId, channel) => {
     if (queueData.isLooping && queueData.currentSong) {
       queueData.queue.unshift(queueData.currentSong);
     }
-    playNextInQueue(guildId, channel);
+    
+    // Jeśli nie ma aktywnego crossfade, przejdź do następnego utworu
+    if (!queueData.isCrossfading) {
+      playNextInQueue(guildId, channel);
+    }
   });
 
   player.on('error', error => {
     console.error('Błąd audio:', error);
+    if (queueData.crossfadeTimeout) {
+      clearTimeout(queueData.crossfadeTimeout);
+      queueData.crossfadeTimeout = null;
+    }
     playNextInQueue(guildId, channel);
   });
+};
+
+const startCrossfade = async (guildId, channel, settings) => {
+  const queueData = getQueue(guildId);
+  
+  if (queueData.queue.length === 0 || queueData.isCrossfading) return;
+  
+  queueData.isCrossfading = true;
+  const nextSong = queueData.queue.shift();
+  
+  try {
+    // Przygotuj następny player z fade in
+    const nextPlayer = createAudioPlayer();
+    let nextResource;
+    
+    if (nextSong.filter || nextSong.speed !== 1.0) {
+      nextResource = createFilteredResource(nextSong.path, nextSong.filter, nextSong.speed);
+    } else {
+      nextResource = createCrossfadeResource(nextSong.path, settings.type, settings.duration, true);
+    }
+    
+    queueData.nextPlayer = nextPlayer;
+    queueData.connection.subscribe(nextPlayer);
+    
+    // Uruchom następny utwór
+    nextPlayer.play(nextResource);
+    
+    // Po zakończeniu crossfade, zamień playery
+    setTimeout(() => {
+      if (queueData.currentPlayer) {
+        queueData.currentPlayer.stop();
+      }
+      
+      queueData.currentPlayer = queueData.nextPlayer;
+      queueData.nextPlayer = null;
+      queueData.currentSong = nextSong;
+      queueData.isCrossfading = false;
+      
+      // Wyślij nową wiadomość o aktualnie granym utworze
+      sendNowPlayingMessage(guildId, channel);
+      
+      // Przygotuj następny crossfade jeśli to możliwe
+      const upcomingNextSong = queueData.queue[0];
+      const shouldCrossfade = shouldUseCrossfade(nextSong, upcomingNextSong, settings);
+      
+      if (shouldCrossfade && upcomingNextSong) {
+        getAudioDuration(nextSong.path).then(duration => {
+          const crossfadeStartTime = Math.max(0, (duration - settings.duration) * 1000);
+          
+          if (duration > settings.minTrackLength) {
+            queueData.crossfadeTimeout = setTimeout(async () => {
+              await startCrossfade(guildId, channel, settings);
+            }, crossfadeStartTime);
+          }
+        }).catch(console.error);
+      }
+      
+      // Event listeners dla nowego playera
+      queueData.currentPlayer.on(AudioPlayerStatus.Idle, () => {
+        if (queueData.crossfadeTimeout) {
+          clearTimeout(queueData.crossfadeTimeout);
+          queueData.crossfadeTimeout = null;
+        }
+        
+        if (queueData.currentSong?.isTemp) {
+          cleanupTempFile(queueData.currentSong);
+        }
+        
+        if (queueData.isLooping && queueData.currentSong) {
+          queueData.queue.unshift(queueData.currentSong);
+        }
+        
+        if (!queueData.isCrossfading) {
+          playNextInQueue(guildId, channel);
+        }
+      });
+      
+      queueData.currentPlayer.on('error', error => {
+        console.error('Błąd audio podczas crossfade:', error);
+        if (queueData.crossfadeTimeout) {
+          clearTimeout(queueData.crossfadeTimeout);
+          queueData.crossfadeTimeout = null;
+        }
+        playNextInQueue(guildId, channel);
+      });
+      
+    }, settings.duration * 1000);
+    
+  } catch (error) {
+    console.error('Błąd podczas crossfade:', error);
+    queueData.isCrossfading = false;
+    // Fallback do normalnego odtwarzania
+    queueData.queue.unshift(nextSong);
+    playNextInQueue(guildId, channel);
+  }
 };
 
 const cleanupTempFile = (songData) => {
@@ -589,6 +799,82 @@ client.on('messageCreate', async (message) => {
       '🔊 Dźwięki przy dołączaniu/odłączaniu zostały włączone.');
   }
 
+  // === KOMENDY CROSSFADE ===
+  if (cmd.startsWith('.crossfade')) {
+    const args = message.content.split(' ').slice(1);
+    const crossfadeSettings = loadCrossfadeSettings();
+
+    // Pokaż aktualne ustawienia
+    if (args.length === 0) {
+      const embed = new EmbedBuilder()
+        .setColor(0x9932CC)
+        .setTitle('🎛️ Ustawienia Crossfade')
+        .addFields(
+          { name: '🔧 Status', value: crossfadeSettings.enabled ? '✅ Włączony' : '❌ Wyłączony', inline: true },
+          { name: '⏱️ Czas przejścia', value: `${crossfadeSettings.duration} sekund`, inline: true },
+          { name: '📈 Typ krzywej', value: crossfadeSettings.type, inline: true },
+          { name: '📏 Min. długość utworu', value: `${crossfadeSettings.minTrackLength} sekund`, inline: true }
+        )
+        .addFields({
+          name: '⚙️ Dostępne komendy',
+          value: [
+            '`.crossfade on/off` - włącz/wyłącz',
+            '`.crossfade duration <1-10>` - ustaw czas (sekundy)',
+            '`.crossfade type <linear/exponential/logarithmic>` - typ krzywej',
+            '`.crossfade minlength <5-30>` - min. długość utworu'
+          ].join('\n'),
+          inline: false
+        })
+        .setFooter({ text: 'Crossfade działa tylko między lokalnymi plikami MP3 bez filtrów' })
+        .setTimestamp();
+
+      return message.reply({ embeds: [embed] });
+    }
+
+    // Włącz/wyłącz crossfade
+    if (args[0] === 'on' || args[0] === 'off') {
+      crossfadeSettings.enabled = args[0] === 'on';
+      saveCrossfadeSettings(crossfadeSettings);
+      return message.reply(`🎛️ Crossfade ${crossfadeSettings.enabled ? 'włączony' : 'wyłączony'}.`);
+    }
+
+    // Ustaw czas przejścia
+    if (args[0] === 'duration') {
+      const duration = parseInt(args[1]);
+      if (isNaN(duration) || duration < 1 || duration > 10) {
+        return message.reply('❌ Czas przejścia musi być między 1 a 10 sekundami.');
+      }
+      crossfadeSettings.duration = duration;
+      saveCrossfadeSettings(crossfadeSettings);
+      return message.reply(`⏱️ Czas crossfade ustawiony na ${duration} sekund.`);
+    }
+
+    // Ustaw typ krzywej
+    if (args[0] === 'type') {
+      const validTypes = ['linear', 'exponential', 'logarithmic'];
+      const type = args[1]?.toLowerCase();
+      if (!validTypes.includes(type)) {
+        return message.reply(`❌ Dostępne typy krzywych: ${validTypes.join(', ')}`);
+      }
+      crossfadeSettings.type = type;
+      saveCrossfadeSettings(crossfadeSettings);
+      return message.reply(`📈 Typ krzywej crossfade ustawiony na: ${type}`);
+    }
+
+    // Ustaw minimalną długość utworu
+    if (args[0] === 'minlength') {
+      const minLength = parseInt(args[1]);
+      if (isNaN(minLength) || minLength < 5 || minLength > 30) {
+        return message.reply('❌ Minimalna długość utworu musi być między 5 a 30 sekundami.');
+      }
+      crossfadeSettings.minTrackLength = minLength;
+      saveCrossfadeSettings(crossfadeSettings);
+      return message.reply(`📏 Minimalna długość utworu dla crossfade ustawiona na ${minLength} sekund.`);
+    }
+
+    return message.reply('❌ Nieznana opcja. Użyj `.crossfade` aby zobaczyć dostępne komendy.');
+  }
+
   // === KOMENDY MUZYCZNE ===
   
   // Help - zaktualizowana lista komend
@@ -629,6 +915,16 @@ client.on('messageCreate', async (message) => {
           inline: false
         },
         {
+          name: '🎛️ Crossfade (NOWE!)',
+          value: [
+            '`.crossfade` - Pokaż ustawienia crossfade',
+            '`.crossfade on/off` - Włącz/wyłącz płynne przejścia',
+            '`.crossfade duration <1-10>` - Czas przejścia (sekundy)',
+            '`.crossfade type <linear/exponential/logarithmic>` - Typ krzywej'
+          ].join('\n'),
+          inline: false
+        },
+        {
           name: '🎛️ Informacje',
           value: [
             '`.np` - Aktualnie grający utwór',
@@ -651,18 +947,20 @@ client.on('messageCreate', async (message) => {
       .addFields({
         name: '🆕 Nowe funkcje',
         value: [
-          '• Bot zostaje na kanale 5 minut po skończeniu playlisty',
-          '• Wiadomości o aktualnie granym utworze wysyłane na kanał z komendą'
+          '• **Crossfade** - Płynne przejścia między utworami (domyślnie włączone)',
+          '• Automatyczne wykrywanie długości utworów',
+          '• Inteligentne zarządzanie - crossfade tylko dla lokalnych plików MP3',
+          '• Bot zostaje na kanale 5 minut po skończeniu playlisty'
         ].join('\n'),
         inline: false
       })
-      .setFooter({ text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0' })
+      .setFooter({ text: 'Filtry: 8d, echo, rate, pitch, bass, bassboost | Speed: 0.1-5.0 | Crossfade: 1-10s' })
       .setTimestamp();
     
     return message.reply({ embeds: [helpEmbed] });
   }
 
-  // Queue - ulepszona komenda z czasem
+  // Queue - ulepszona komenda z czasem i crossfade info
   if (['.queue', '.q'].includes(cmd)) {
     const queueData = getQueue(message.guild.id);
     
@@ -671,6 +969,7 @@ client.on('messageCreate', async (message) => {
     }
 
     const queueTime = calculateQueueTime(queueData.queue);
+    const crossfadeSettings = loadCrossfadeSettings();
     
     const embed = new EmbedBuilder()
       .setColor(0x0099FF)
@@ -716,6 +1015,12 @@ client.on('messageCreate', async (message) => {
     }
     if (queueData.isLooping) {
       infoFields.push('🔄 **Zapętlanie włączone**');
+    }
+    if (crossfadeSettings.enabled) {
+      infoFields.push(`🎛️ **Crossfade:** ${crossfadeSettings.duration}s ${crossfadeSettings.type}`);
+    }
+    if (queueData.isCrossfading) {
+      infoFields.push('🎵 **Status:** Crossfade w toku...');
     }
     
     if (infoFields.length > 0) {
@@ -782,6 +1087,8 @@ client.on('messageCreate', async (message) => {
       }
 
       const totalTime = calculateQueueTime(queueData.queue);
+      const crossfadeSettings = loadCrossfadeSettings();
+      
       const embed = new EmbedBuilder()
         .setColor(0x00FF00)
         .setTitle('🎲 Losowa Playlista Uruchomiona!')
@@ -794,13 +1101,22 @@ client.on('messageCreate', async (message) => {
           name: '🎵 Pierwszych 5 utworów',
           value: shuffledFiles.slice(0, 5).map((name, i) => `${i + 1}. ${name}`).join('\n'),
           inline: false
-        })
-        .addFields({
-          name: '📢 Informacja',
-          value: '• Wiadomości o aktualnie grających utworach będą wysyłane na tym kanale\n• Bot zostanie na kanale przez 5 minut po zakończeniu playlisty',
+        });
+
+      if (crossfadeSettings.enabled) {
+        embed.addFields({
+          name: '🎛️ Crossfade',
+          value: `Płynne przejścia włączone (${crossfadeSettings.duration}s ${crossfadeSettings.type})`,
           inline: false
-        })
-        .setTimestamp();
+        });
+      }
+
+      embed.addFields({
+        name: '📢 Informacja',
+        value: '• Wiadomości o aktualnie grających utworach będą wysyłane na tym kanale\n• Bot zostanie na kanale przez 5 minut po zakończeniu playlisty',
+        inline: false
+      })
+      .setTimestamp();
 
       return message.reply({ embeds: [embed] });
 
@@ -817,6 +1133,13 @@ client.on('messageCreate', async (message) => {
       if (!queueData.currentPlayer) {
         return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
       }
+      
+      // Wyczyść crossfade timeout jeśli istnieje
+      if (queueData.crossfadeTimeout) {
+        clearTimeout(queueData.crossfadeTimeout);
+        queueData.crossfadeTimeout = null;
+      }
+      
       queueData.currentPlayer.stop();
       return message.reply('⏭️ Pomijam aktualny utwór.');
     },
@@ -826,6 +1149,12 @@ client.on('messageCreate', async (message) => {
       if (!queueData.currentPlayer) {
         return message.reply('❌ Nie ma aktualnie odtwarzanej muzyki.');
       }
+      
+      if (queueData.crossfadeTimeout) {
+        clearTimeout(queueData.crossfadeTimeout);
+        queueData.crossfadeTimeout = null;
+      }
+      
       queueData.currentPlayer.stop();
       return message.reply('⏭️ Pomijam aktualny utwór.');
     },
@@ -862,6 +1191,13 @@ client.on('messageCreate', async (message) => {
     '.clear': () => {
       const queueData = getQueue(message.guild.id);
       queueData.queue = [];
+      
+      // Wyczyść crossfade timeout
+      if (queueData.crossfadeTimeout) {
+        clearTimeout(queueData.crossfadeTimeout);
+        queueData.crossfadeTimeout = null;
+      }
+      
       return message.reply('🗑️ Wyczyszczono kolejkę.');
     },
     
@@ -892,7 +1228,12 @@ client.on('messageCreate', async (message) => {
         filterText = ` (filtr: ${queueData.currentSong.filter})`;
       }
       
-      return message.reply(`🎵 **Aktualnie gra:** ${queueData.currentSong.name}${filterText}`);
+      let crossfadeText = '';
+      if (queueData.isCrossfading) {
+        crossfadeText = ' 🎛️ (crossfade w toku)';
+      }
+      
+      return message.reply(`🎵 **Aktualnie gra:** ${queueData.currentSong.name}${filterText}${crossfadeText}`);
     }
   };
 
@@ -926,8 +1267,9 @@ client.on('messageCreate', async (message) => {
         const start = page * soundsPerPage;
         const end = Math.min(start + soundsPerPage, files.length);
         const pageSounds = files.slice(start, end);
+        const crossfadeSettings = loadCrossfadeSettings();
 
-        return new EmbedBuilder()
+        const embed = new EmbedBuilder()
           .setColor(0x0099FF)
           .setTitle('🎵 Dostępne Dźwięki')
           .setDescription(`Lista wszystkich dostępnych dźwięków (${files.length} łącznie)`)
@@ -937,11 +1279,22 @@ client.on('messageCreate', async (message) => {
               `\`${start + index + 1}.\` ${sound}`
             ).join('\n'),
             inline: false
-          })
-          .setFooter({ 
-            text: 'Użyj przycisków aby nawigować lub odtworzyć dźwięk • Kliknij "🎲 Losowy" dla przypadkowego dźwięku' 
-          })
-          .setTimestamp();
+          });
+
+        if (crossfadeSettings.enabled) {
+          embed.addFields({
+            name: '🎛️ Crossfade',
+            value: `Włączone (${crossfadeSettings.duration}s ${crossfadeSettings.type})`,
+            inline: true
+          });
+        }
+
+        embed.setFooter({ 
+          text: 'Użyj przycisków aby nawigować lub odtworzyć dźwięk • Kliknij "🎲 Losowy" dla przypadkowego dźwięku' 
+        })
+        .setTimestamp();
+
+        return embed;
       };
 
       const generateButtons = (page, sounds) => {
@@ -1401,8 +1754,6 @@ client.on('voiceStateUpdate', async (oldState, newState) => {
   }
 });
 
-
-
 client.once('ready', () => {
     console.log(`Bot zalogowany jako ${client.user.tag}!`);
 });
@@ -1435,6 +1786,4 @@ client.on('ready', () => {
     sendMessageToChannel();
 });
 
-
 client.login(process.env.DISCORD_TOKEN);
-
